@@ -2,19 +2,7 @@
 Test chunking functionality for large documents.
 """
 import pytest
-from memory.llm_client import chunk_text, split_into_sentences
-
-
-def test_split_into_sentences():
-    """Test sentence splitting."""
-    text = "This is sentence one. This is sentence two! Is this sentence three? Yes it is."
-    sentences = split_into_sentences(text)
-
-    assert len(sentences) == 4, f"Expected 4 sentences, got {len(sentences)}"
-    assert "This is sentence one" in sentences[0]
-    assert "This is sentence two" in sentences[1]
-    assert "Is this sentence three" in sentences[2]
-    assert "Yes it is" in sentences[3]
+from memory.llm_client import chunk_text
 
 
 def test_chunk_text_small():

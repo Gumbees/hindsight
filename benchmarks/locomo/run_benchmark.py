@@ -13,10 +13,12 @@ import json
 from datetime import datetime, timezone, timedelta
 from memory import TemporalSemanticMemory
 from typing import List, Dict
+from openai import AsyncOpenAI
 import openai
 from dotenv import load_dotenv
 import os
 import asyncio
+import pydantic
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
@@ -25,6 +27,24 @@ from rich import box
 load_dotenv()
 
 console = Console()
+
+
+def get_groq_client() -> AsyncOpenAI:
+    """
+    Get configured async Groq client for LLM judge.
+
+    Returns:
+        Configured AsyncOpenAI client pointing to Groq
+    """
+    groq_api_key = os.getenv('GROQ_API_KEY')
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY environment variable not set")
+
+    base_url = os.getenv('GROQ_BASE_URL', 'https://api.groq.com/openai/v1')
+    return AsyncOpenAI(
+        api_key=groq_api_key,
+        base_url=base_url
+    )
 
 
 def parse_date(date_string: str) -> datetime:
@@ -41,7 +61,7 @@ async def ingest_conversation(memory: TemporalSemanticMemory, conversation_data:
     """
     Ingest a LoComo conversation into the memory system (ASYNC version).
 
-    Ingests entire conversation as a single large document for maximum efficiency.
+    Ingests ALL sessions in ONE batch for maximum efficiency.
 
     Args:
         memory: Memory system instance
@@ -55,10 +75,9 @@ async def ingest_conversation(memory: TemporalSemanticMemory, conversation_data:
     # Get all session keys sorted
     session_keys = sorted([k for k in conv.keys() if k.startswith('session_') and not k.endswith('_date_time')])
 
+    # Collect all sessions as batch items
+    batch_contents = []
     total_turns = 0
-
-    # Build entire conversation as one large text
-    conversation_parts = []
 
     for session_key in session_keys:
         if session_key not in conv or not isinstance(conv[session_key], list):
@@ -66,34 +85,45 @@ async def ingest_conversation(memory: TemporalSemanticMemory, conversation_data:
 
         session_data = conv[session_key]
 
-        # Add all turns from this session
+        # Build session content from all turns
+        session_parts = []
         for turn in session_data:
             speaker = turn['speaker']
             text = turn['text']
-            conversation_parts.append(f"{speaker} said: {text}")
+            session_parts.append(f"{speaker}: {text}")
             total_turns += 1
 
-    # Ingest entire conversation in ONE put_async call
-    # Use the first session date as the event date
-    first_session_key = session_keys[0] if session_keys else "session_1"
-    date_key = f"{first_session_key}_date_time"
-    conversation_date = parse_date(conv.get(date_key, "1:00 pm on 1 January, 2023"))
+        if not session_parts:
+            continue
 
-    full_conversation = " ".join(conversation_parts)
+        # Get session date
+        date_key = f"{session_key}_date_time"
+        session_date = parse_date(conv.get(date_key, "1:00 pm on 1 January, 2023"))
 
-    await memory.put_async(
-        agent_id=agent_id,
-        content=full_conversation,
-        context=f"Full conversation between {speaker_a} and {speaker_b}",
-        event_date=conversation_date
-    )
+        # Add to batch
+        session_content = "\n".join(session_parts)
+        batch_contents.append({
+            "content": session_content,
+            "context": f"Conversation session between {speaker_a} and {speaker_b}",
+            "event_date": session_date
+        })
+
+    # Ingest ALL sessions in ONE batch call (MUCH faster!)
+    if batch_contents:
+        await memory.put_batch_async(
+            agent_id=agent_id,
+            contents=batch_contents
+        )
 
     return total_turns
 
+class QuestionAnswer(pydantic.BaseModel):
+    answer: str
+    reasoning: str
 
-def answer_question(memory: TemporalSemanticMemory, agent_id: str, question: str, thinking_budget: int = 100) -> str:
+async def answer_question(memory: TemporalSemanticMemory, agent_id: str, question: str, thinking_budget: int = 500) -> tuple[str, str, List[Dict]]:
     """
-    Answer a question using the memory system.
+    Answer a question using the memory system (ASYNC version).
 
     Args:
         memory: Memory system instance
@@ -102,36 +132,33 @@ def answer_question(memory: TemporalSemanticMemory, agent_id: str, question: str
         thinking_budget: How many memory units to explore
 
     Returns:
-        Answer string
+        Tuple of (answer string, reasoning string, retrieved memories list)
     """
     # Search memory
-    results = memory.search(
+    results = await memory.search_async(
         agent_id=agent_id,
         query=question,
         thinking_budget=thinking_budget,
         top_k=20  # Get more results for better context
     )
-    print("question:", question)
-    print("Got results:", results)
-
     if not results:
-        return "I don't have enough information to answer that question."
+        return "I don't have enough information to answer that question.", "No relevant memories found.", []
 
-    # Build context from top results
     context_parts = []
-    for i, result in enumerate(results[:10], 1):
+    for i, result in enumerate(results):
         context_parts.append(f"{i}. {result['text']}")
 
     context = "\n".join(context_parts)
 
-    # Use OpenAI to generate answer from context
+    # Use AsyncOpenAI to generate answer from context
     try:
-        response = openai.chat.completions.create(
+        client = AsyncOpenAI()
+        response = await client.beta.chat.completions.parse(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant. Answer the question based ONLY on the provided context. If the context doesn't contain the answer, say 'I don't know'."
+                    "content": "You are a helpful assistant. Answer the question based ONLY on the provided context. If the context doesn't contain the answer, say 'I don't know'. In the reasoning, explain why you choose or not choose the context items for the answer."
                 },
                 {
                     "role": "user",
@@ -139,14 +166,16 @@ def answer_question(memory: TemporalSemanticMemory, agent_id: str, question: str
                 }
             ],
             temperature=0,
-            max_tokens=150
+            max_tokens=8000,
+            response_format=QuestionAnswer
         )
-        return response.choices[0].message.content.strip()
+        answer = response.choices[0].message.parsed
+        return answer.answer, answer.reasoning, results
     except Exception as e:
-        return f"Error generating answer: {str(e)}"
+        return f"Error generating answer: {str(e)}", "Error occurred during answer generation.", results
 
 
-def evaluate_qa_task(
+async def evaluate_qa_task(
     memory: TemporalSemanticMemory,
     agent_id: str,
     qa_pairs: List[Dict],
@@ -154,13 +183,11 @@ def evaluate_qa_task(
     max_questions: int = None
 ) -> Dict:
     """
-    Evaluate the QA task.
+    Evaluate the QA task (ASYNC version - processes questions in parallel).
 
     Returns:
         Dict with evaluation metrics
     """
-    results = []
-
     questions_to_eval = qa_pairs[:max_questions] if max_questions else qa_pairs
 
     with Progress(
@@ -170,38 +197,97 @@ def evaluate_qa_task(
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         console=console
     ) as progress:
-        task = progress.add_task(f"[cyan]Evaluating QA for sample {sample_id}...", total=len(questions_to_eval))
+        task = progress.add_task(f"[cyan]Evaluating QA for sample {sample_id} (parallel)...", total=len(questions_to_eval))
 
-        for qa in questions_to_eval:
+        # Create tasks for all questions
+        async def process_question(qa):
             question = qa['question']
             correct_answer = qa['answer']
             category = qa.get('category', 0)
 
-            # Get predicted answer
-            predicted_answer = answer_question(memory, agent_id, question)
+            # Get predicted answer, reasoning, and retrieved memories
+            predicted_answer, reasoning, retrieved_memories = await answer_question(memory, agent_id, question)
 
-            results.append({
+            return {
                 'question': question,
                 'correct_answer': correct_answer,
                 'predicted_answer': predicted_answer,
-                'category': category
-            })
+                'reasoning': reasoning,
+                'category': category,
+                'retrieved_memories': retrieved_memories
+            }
 
+        # Process all questions in parallel
+        question_tasks = [process_question(qa) for qa in questions_to_eval]
+
+        # Use as_completed to update progress as results come in
+        results = []
+        for coro in asyncio.as_completed(question_tasks):
+            result = await coro
+            results.append(result)
             progress.update(task, advance=1)
 
     return results
 
+class JudgeResponse(pydantic.BaseModel):
+    correct: bool
+    reasoning: str
 
-def calculate_metrics(results: List[Dict]) -> Dict:
+async def judge_single_answer(client: AsyncOpenAI, result: Dict, semaphore: asyncio.Semaphore) -> Dict:
     """
-    Calculate evaluation metrics.
+    Judge a single answer using LLM (with concurrency control).
 
-    Uses LLM-as-judge to evaluate answer quality.
+    Args:
+        client: Async OpenAI client (Groq)
+        result: Result dict with question, correct_answer, predicted_answer, category
+        semaphore: Semaphore to limit concurrent requests
+
+    Returns:
+        Updated result dict with is_correct field
     """
-    correct = 0
+    async with semaphore:
+        try:
+            response = await client.beta.chat.completions.parse(
+                model="openai/gpt-oss-120b",
+                messages=[
+                    {
+                        "role": "system",
+                        "content":
+                            "You are an objective judge. Determine if the predicted answer contains the correct answer or they are the same content (with different form is fine)."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {result['question']}\nCorrect answer: {result['correct_answer']}\nPredicted answer: {result['predicted_answer']}\n\nAre they equivalent?"
+                    }
+                ],
+                temperature=0,
+                max_tokens=512,
+                response_format=JudgeResponse
+
+            )
+
+            judgement = response.choices[0].message.parsed
+            result['is_correct'] = judgement.correct
+            result['correctness_reasoning'] = judgement.reasoning
+
+        except Exception as e:
+            console.print(f"[red]Error judging answer: {e}[/red]")
+            result['is_correct'] = False
+
+    return result
+
+
+async def calculate_metrics(results: List[Dict]) -> Dict:
+    """
+    Calculate evaluation metrics using parallel LLM-as-judge.
+
+    Processes up to 8 judgments concurrently for speed.
+    """
     total = len(results)
+    client = get_groq_client()
 
-    category_stats = {}
+    # Semaphore to limit to 8 concurrent requests
+    semaphore = asyncio.Semaphore(8)
 
     with Progress(
         SpinnerColumn(),
@@ -210,48 +296,32 @@ def calculate_metrics(results: List[Dict]) -> Dict:
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         console=console
     ) as progress:
-        task = progress.add_task("[yellow]Judging answers with LLM...", total=total)
+        task = progress.add_task("[yellow]Judging answers with LLM (parallel, max 8)...", total=total)
 
+        # Create all judgment tasks
+        judgment_tasks = []
         for result in results:
-            # Use LLM as judge
-            try:
-                response = openai.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an objective judge. Determine if the predicted answer is semantically equivalent to the correct answer. Answer with ONLY 'yes' or 'no'."
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Question: {result['question']}\nCorrect answer: {result['correct_answer']}\nPredicted answer: {result['predicted_answer']}\n\nAre they equivalent?"
-                        }
-                    ],
-                    temperature=0,
-                    max_tokens=5
-                )
+            judgment_task = judge_single_answer(client, result, semaphore)
+            judgment_tasks.append(judgment_task)
 
-                judgment = response.choices[0].message.content.strip().lower()
-                is_correct = 'yes' in judgment
-
-                if is_correct:
-                    correct += 1
-
-                result['is_correct'] = is_correct
-
-                # Track by category
-                category = result['category']
-                if category not in category_stats:
-                    category_stats[category] = {'correct': 0, 'total': 0}
-                category_stats[category]['total'] += 1
-                if is_correct:
-                    category_stats[category]['correct'] += 1
-
-            except Exception as e:
-                console.print(f"[red]Error judging answer: {e}[/red]")
-                result['is_correct'] = False
-
+        # Process in parallel with progress updates
+        judged_results = []
+        for coro in asyncio.as_completed(judgment_tasks):
+            judged_result = await coro
+            judged_results.append(judged_result)
             progress.update(task, advance=1)
+
+    # Calculate stats
+    correct = sum(1 for r in judged_results if r.get('is_correct', False))
+    category_stats = {}
+
+    for result in judged_results:
+        category = result['category']
+        if category not in category_stats:
+            category_stats[category] = {'correct': 0, 'total': 0}
+        category_stats[category]['total'] += 1
+        if result.get('is_correct', False):
+            category_stats[category]['correct'] += 1
 
     accuracy = (correct / total * 100) if total > 0 else 0
 
@@ -260,17 +330,82 @@ def calculate_metrics(results: List[Dict]) -> Dict:
         'correct': correct,
         'total': total,
         'category_stats': category_stats,
-        'detailed_results': results
+        'detailed_results': judged_results
     }
 
 
-def run_benchmark(max_conversations: int = None, max_questions_per_conv: int = None):
+async def process_single_conversation(
+    memory: TemporalSemanticMemory,
+    conv_data: Dict,
+    i: int,
+    total_convs: int,
+    max_questions_per_conv: int,
+    skip_ingestion: bool
+) -> Dict:
+    """
+    Process a single conversation (ingest + evaluate).
+
+    Args:
+        memory: Memory system instance
+        conv_data: Conversation data
+        i: Conversation index (1-based)
+        total_convs: Total number of conversations
+        max_questions_per_conv: Max questions to evaluate per conversation
+        skip_ingestion: Whether to skip ingestion
+
+    Returns:
+        Result dict with sample_id, metrics, total_turns
+    """
+    sample_id = conv_data['sample_id']
+    agent_id = "locomo"  # Single agent for all Locomo benchmark data
+
+    console.print(f"\n[bold blue]Conversation {i}/{total_convs}[/bold blue] (Sample ID: {sample_id})")
+
+    if not skip_ingestion:
+        # Clear previous locomo agent data only (multi-tenant safe)
+        if i == 1:  # Only cleanup on first conversation
+            console.print("  [2] Clearing previous 'locomo' agent data...")
+            memory.delete_agent(agent_id)
+            console.print(f"      [green]✓[/green] Cleared 'locomo' agent data")
+
+        # Ingest conversation (sessions processed in parallel)
+        console.print("  [3] Ingesting conversation (sessions in parallel)...")
+        total_turns = await ingest_conversation(memory, conv_data, agent_id)
+        console.print(f"      [green]✓[/green] Ingested {total_turns} turns across multiple sessions")
+    else:
+        total_turns = -1
+
+    # Evaluate QA (async - questions processed in parallel)
+    console.print(f"  [4] Evaluating {len(conv_data['qa'])} QA pairs (parallel)...")
+    qa_results = await evaluate_qa_task(
+        memory,
+        agent_id,
+        conv_data['qa'],
+        sample_id,
+        max_questions=max_questions_per_conv
+    )
+
+    # Calculate metrics (async with parallel LLM judging)
+    console.print("  [5] Calculating metrics...")
+    metrics = await calculate_metrics(qa_results)
+
+    console.print(f"      [green]✓[/green] Accuracy: {metrics['accuracy']:.2f}% ({metrics['correct']}/{metrics['total']})")
+
+    return {
+        'sample_id': sample_id,
+        'metrics': metrics,
+        'total_turns': total_turns
+    }
+
+
+def run_benchmark(max_conversations: int = None, max_questions_per_conv: int = None, skip_ingestion: bool = False):
     """
     Run the LoComo benchmark.
 
     Args:
         max_conversations: Maximum number of conversations to evaluate (None for all)
         max_questions_per_conv: Maximum questions per conversation (None for all)
+        skip_ingestion: Whether to skip ingestion and use existing data
     """
     console.print("\n[bold cyan]LoComo Benchmark - Entity-Aware Memory System[/bold cyan]")
     console.print("=" * 80)
@@ -288,54 +423,17 @@ def run_benchmark(max_conversations: int = None, max_questions_per_conv: int = N
     memory = TemporalSemanticMemory()
     console.print("    [green]✓[/green] Memory system initialized")
 
-    # Run evaluation for each conversation
+    # Run evaluation (conversations sequential, sessions within each conversation parallel)
     all_results = []
 
     for i, conv_data in enumerate(conversations_to_eval, 1):
-        sample_id = conv_data['sample_id']
-        agent_id = f"locomo_{sample_id}"
-
-        console.print(f"\n[bold blue]Conversation {i}/{len(conversations_to_eval)}[/bold blue] (Sample ID: {sample_id})")
-
-        # Clear previous data
-        import psycopg2
-        conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM memory_units WHERE agent_id = %s", (agent_id,))
-        cursor.execute("DELETE FROM memory_links WHERE agent_id = %s", (agent_id,))
-        cursor.execute("DELETE FROM entity_cooccurrences WHERE agent_id = %s", (agent_id,))
-        cursor.execute("DELETE FROM unit_entities WHERE agent_id = %s", (agent_id,))
-        cursor.execute("DELETE FROM entities WHERE agent_id = %s", (agent_id,))
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-        # Ingest conversation (using async for parallel embedding generation)
-        console.print("  [3] Ingesting conversation (async with parallel embeddings)...")
-        total_turns = asyncio.run(ingest_conversation(memory, conv_data, agent_id))
-        console.print(f"      [green]✓[/green] Ingested {total_turns} conversation turns")
-
-        # Evaluate QA
-        console.print(f"  [4] Evaluating {len(conv_data['qa'])} QA pairs...")
-        qa_results = evaluate_qa_task(
-            memory,
-            agent_id,
-            conv_data['qa'],
-            sample_id,
-            max_questions=max_questions_per_conv
+        result = asyncio.run(
+            process_single_conversation(
+                memory, conv_data, i, len(conversations_to_eval),
+                max_questions_per_conv, skip_ingestion
+            )
         )
-
-        # Calculate metrics
-        console.print("  [5] Calculating metrics...")
-        metrics = calculate_metrics(qa_results)
-
-        console.print(f"      [green]✓[/green] Accuracy: {metrics['accuracy']:.2f}% ({metrics['correct']}/{metrics['total']})")
-
-        all_results.append({
-            'sample_id': sample_id,
-            'metrics': metrics,
-            'total_turns': total_turns
-        })
+        all_results.append(result)
 
     # Overall results
     console.print("\n[bold green]✓ Benchmark Complete![/bold green]\n")
@@ -387,12 +485,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run LoComo benchmark')
     parser.add_argument('--max-conversations', type=int, default=None, help='Maximum conversations to evaluate')
     parser.add_argument('--max-questions', type=int, default=None, help='Maximum questions per conversation')
+    parser.add_argument('--skip-ingestion', action='store_true', help='Skip ingestion and use existing data')
 
     args = parser.parse_args()
 
     results = run_benchmark(
         max_conversations=args.max_conversations,
-        max_questions_per_conv=args.max_questions
+        max_questions_per_conv=args.max_questions,
+        skip_ingestion=args.skip_ingestion
     )
 
     # Save results

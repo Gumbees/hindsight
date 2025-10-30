@@ -21,3 +21,9 @@ wheels/
 
 # NLTK data (will be downloaded automatically)
 nltk_data/
+
+# Large benchmark datasets (will be downloaded automatically)
+benchmarks/longmemeval/longmemeval_s_cleaned.json
+
+# Debug logs
+logs/

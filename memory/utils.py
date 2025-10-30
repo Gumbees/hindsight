@@ -1,24 +1,28 @@
 """
 Utility functions for memory system.
 """
-from typing import List
+from datetime import datetime
+from typing import List, Dict
 from .llm_client import extract_facts_from_text
 
 
-async def extract_facts(text: str) -> List[str]:
+async def extract_facts(text: str, event_date: datetime, context: str = "") -> List[Dict[str, str]]:
     """
     Extract semantic facts from text using LLM.
 
     Uses LLM for intelligent fact extraction that:
     - Filters out social pleasantries and filler words
-    - Creates self-contained statements
+    - Creates self-contained statements with absolute dates
     - Handles conversational text well
+    - Resolves relative time expressions to absolute dates
 
     Args:
         text: Input text (conversation, article, etc.)
+        event_date: Reference date for resolving relative times
+        context: Context about the conversation/document
 
     Returns:
-        List of factual statements
+        List of fact dictionaries with keys: 'fact' (text) and 'date' (ISO string)
 
     Raises:
         Exception: If LLM fact extraction fails
@@ -26,14 +30,12 @@ async def extract_facts(text: str) -> List[str]:
     if not text or not text.strip():
         return []
 
-    fact_dicts = await extract_facts_from_text(text)
-    # Extract just the fact text
-    facts = [f['fact'] for f in fact_dicts if f.get('fact')]
+    fact_dicts = await extract_facts_from_text(text, event_date, context)
 
-    if not facts:
+    if not fact_dicts:
         raise Exception(f"LLM extracted 0 facts from text of length {len(text)}. This may indicate the text contains no meaningful information, or the LLM failed to extract facts.")
 
-    return facts
+    return fact_dicts
 
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:

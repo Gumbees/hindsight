@@ -2,10 +2,10 @@
 Pytest configuration and shared fixtures.
 """
 import pytest
-import psycopg2
 import os
 from dotenv import load_dotenv
 from memory import TemporalSemanticMemory
+import psycopg2
 
 load_dotenv()
 
@@ -24,28 +24,17 @@ def memory():
 def clean_agent(memory):
     """
     Provide a clean agent ID and clean up data after test.
+    Uses agent_id='test' for all tests (multi-tenant isolation).
     """
-    agent_id = "test_agent"
+    agent_id = "test"
 
     # Clean up before test
-    conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM memory_units WHERE agent_id = %s", (agent_id,))
-    cursor.execute("DELETE FROM entities WHERE agent_id = %s", (agent_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    memory.delete_agent(agent_id)
 
     yield agent_id
 
     # Clean up after test
-    conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM memory_units WHERE agent_id = %s", (agent_id,))
-    cursor.execute("DELETE FROM entities WHERE agent_id = %s", (agent_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    memory.delete_agent(agent_id)
 
 
 @pytest.fixture

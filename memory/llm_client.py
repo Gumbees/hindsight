@@ -6,6 +6,8 @@ Uses OpenAI-compatible API (works with Groq, OpenAI, etc.)
 import os
 import json
 import re
+import asyncio
+from datetime import datetime
 from typing import List, Dict, Optional, Literal
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -16,16 +18,8 @@ class ExtractedFact(BaseModel):
     fact: str = Field(
         description="Self-contained factual statement with subject + action + context"
     )
-    speaker: str = Field(
-        default="narrator",
-        description="Who said this (name or 'narrator' if not a conversation)"
-    )
-    type: Literal["biographical", "event", "opinion", "recommendation", "description", "relationship"] = Field(
-        description="Category of the fact"
-    )
-    confidence: Literal["high", "medium", "low"] = Field(
-        default="medium",
-        description="Confidence level of the extraction"
+    date: str = Field(
+        description="Absolute date/time when this fact occurred in ISO format (YYYY-MM-DDTHH:MM:SSZ). If text mentions relative time (yesterday, last week, this morning), calculate absolute date from the provided context date."
     )
 
 
@@ -36,75 +30,48 @@ class FactExtractionResponse(BaseModel):
     )
 
 
-def split_into_sentences(text: str) -> List[str]:
-    """
-    Fast sentence splitter using regex.
-    Splits on periods, exclamation marks, and question marks followed by whitespace or end of string.
-
-    Args:
-        text: Input text to split
-
-    Returns:
-        List of sentences
-    """
-    # Split on sentence boundaries: .!? followed by space/newline/end
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if s.strip()]
-
-
 def chunk_text(text: str, max_chars: int = 120000) -> List[str]:
     """
-    Split text into chunks at sentence boundaries.
+    Split text into chunks at sentence boundaries using LangChain's text splitter.
 
-    Keeps chunks under max_chars (~30k tokens assuming 1 token ≈ 4 chars).
-    This prevents hitting output token limits on large documents.
+    Uses RecursiveCharacterTextSplitter which intelligently splits at sentence boundaries
+    and allows chunks to slightly exceed max_chars to finish sentences naturally.
 
     Args:
         text: Input text to chunk
         max_chars: Maximum characters per chunk (default 120k ≈ 30k tokens)
+                   Note: chunks may slightly exceed this to complete sentences
 
     Returns:
-        List of text chunks, each under max_chars
+        List of text chunks, roughly under max_chars
     """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
     # If text is small enough, return as-is
     if len(text) <= max_chars:
         return [text]
 
-    sentences = split_into_sentences(text)
-    chunks = []
-    current_chunk = []
-    current_length = 0
+    # Configure splitter to split at sentence boundaries first
+    # Separators in order of preference: paragraphs, newlines, sentences, words
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max_chars,
+        chunk_overlap=0,
+        length_function=len,
+        is_separator_regex=False,
+        separators=[
+            "\n\n",  # Paragraph breaks
+            "\n",    # Line breaks
+            ". ",    # Sentence endings
+            "! ",    # Exclamations
+            "? ",    # Questions
+            "; ",    # Semicolons
+            ", ",    # Commas
+            " ",     # Words
+            "",      # Characters (last resort)
+        ],
+    )
 
-    for sentence in sentences:
-        sentence_length = len(sentence)
-
-        # If single sentence exceeds max_chars, split it forcefully
-        if sentence_length > max_chars:
-            # Save current chunk if any
-            if current_chunk:
-                chunks.append(' '.join(current_chunk))
-                current_chunk = []
-                current_length = 0
-
-            # Split long sentence into smaller pieces
-            for i in range(0, len(sentence), max_chars):
-                chunks.append(sentence[i:i + max_chars])
-            continue
-
-        # If adding this sentence would exceed limit, start new chunk
-        if current_length + sentence_length + 1 > max_chars:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = [sentence]
-            current_length = sentence_length
-        else:
-            current_chunk.append(sentence)
-            current_length += sentence_length + 1  # +1 for space
-
-    # Add remaining chunk
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-
-    return chunks
+    return splitter.split_text(text)
 
 
 def get_llm_client() -> AsyncOpenAI:
@@ -137,22 +104,28 @@ def get_llm_client() -> AsyncOpenAI:
     )
 
 
-async def extract_facts_from_text(
-    text: str,
-    model: str = "openai/gpt-oss-20b",
-    temperature: float = 0.1,
-    max_tokens: int = 65000,
-    chunk_size: int = 60000
+async def _extract_facts_from_chunk(
+    chunk: str,
+    chunk_index: int,
+    total_chunks: int,
+    event_date: datetime,
+    context: str,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    client: AsyncOpenAI
 ) -> List[Dict[str, str]]:
-    client = get_llm_client()
+    """
+    Extract facts from a single chunk (internal helper for parallel processing).
+    """
+    # Format event_date for the prompt
+    event_date_str = event_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Chunk text if necessary
-    chunks = chunk_text(text, max_chars=chunk_size)
+    prompt = f"""You are extracting facts from text for an AI memory system. Each fact will be stored and retrieved later.
 
-    all_facts = []
-
-    for i, chunk in enumerate(chunks):
-        prompt = f"""You are extracting facts from text for an AI memory system. Each fact will be stored and retrieved later.
+## CONTEXT INFORMATION
+- Current reference date/time: {event_date_str}
+- Context: {context if context else 'no context provided'}
 
 ## CRITICAL: Facts must be DETAILED and COMPREHENSIVE
 
@@ -164,66 +137,158 @@ Each fact should:
 5. Include surrounding context that makes the fact meaningful
 6. Capture nuances, reasons, causes, and implications
 
-## What to EXTRACT:
-- Biographical information (jobs, roles, backgrounds, experiences)
-- Events (what happened, when, where, who was involved, why)
-- Opinions and beliefs (who believes what and why)
-- Recommendations and advice (specific suggestions with reasoning)
-- Descriptions (detailed explanations of how things work)
-- Relationships (connections between people, organizations, concepts)
+## TEMPORAL INFORMATION (VERY IMPORTANT)
+For each fact, extract the ABSOLUTE date/time when it occurred:
+- If text mentions ABSOLUTE dates ("on March 15, 2024", "last Tuesday"), use that date
+- If text mentions RELATIVE times ("yesterday", "last week", "this morning", "3 days ago"), calculate the absolute date using the reference date above.
+- if text mentions a vague relative time without a specific day ("last week", "this morning"), transform the date in relative with absolute context ("last week" + " 2 june 2024" -> "week before June 2 2024") in the text and use the absolute date for the 'date' field 
+- If NO specific time is mentioned, use the reference date
+- Always output dates in ISO format: YYYY-MM-DDTHH:MM:SSZ
 
-## What to SKIP:
-- Greetings, thank yous, acknowledgments
+Examples of date extraction:
+- Reference: 2024-03-20T10:00:00Z
+- "Yesterday I went hiking" → date: 2024-03-19T10:00:00Z
+- "Last week I joined Google" → date: 2024-03-13T10:00:00Z (approximately)
+- "This morning I had coffee" → date: 2024-03-20T08:00:00Z
+- "I work at Google" (no time mentioned) → date: 2024-03-20T10:00:00Z (use reference)
+
+## What to EXTRACT (BE EXHAUSTIVE - DO NOT SKIP ANYTHING):
+- **Biographical information**: jobs, roles, backgrounds, experiences, skills
+- **Events (NEVER MISS THESE)**:
+  - ANY action that happened (went, did, attended, joined, started, finished, etc.)
+  - Photos, images, videos shared or taken ("here's a photo", "took a picture", "captured")
+  - Social activities (meetups, gatherings, meals, conversations)
+  - Achievements, milestones, accomplishments
+  - Travels, visits, locations visited
+  - Purchases, acquisitions, creations
+- **Opinions and beliefs**: who believes what and why
+- **Recommendations and advice**: specific suggestions with reasoning
+- **Descriptions**: detailed explanations of how things work
+- **Relationships**: connections between people, organizations, concepts
+- **States and conditions**: current status, ongoing situations
+
+## CRITICAL: Extract EVERY event mentioned, even casual ones
+- "here's a photo of X" = someone took/shared a photo of X
+- "I was with friends last week" = meetup/gathering with friends last week
+- "sent you that link" = action of sending a link
+- DO NOT skip events just because they seem minor or casual
+
+## What to SKIP (ONLY these):
+- Greetings, thank yous, acknowledgments (unless they reveal information)
 - Filler words ("um", "uh", "like")
-- Pure reactions without content ("wow", "cool")
-- Incomplete thoughts
+- Pure reactions without content ("wow", "cool", "nice")
+- Incomplete thoughts or sentence fragments with no meaning
 
 ## EXAMPLES of GOOD facts (detailed, comprehensive):
 
-Input: "Alice mentioned she works at Google in Mountain View. She joined the AI team last year and loves working on large language models."
-GOOD: "Alice works at Google in Mountain View on the AI team, which she joined last year, and she loves working on large language models"
-BAD: "Alice works at Google" (too short, missing context)
+Input: "Alice mentioned she works at Google in Mountain View. She joined the AI team last year."
+GOOD fact: "Alice works at Google in Mountain View on the AI team, which she joined last year"
+GOOD date: Calculate based on reference date (if reference is 2024-03-20, "last year" = 2023-03-20)
 
-Input: "Bob said he's been hiking every weekend in Yosemite because it helps him clear his mind after stressful work weeks."
-GOOD: "Bob has been hiking every weekend in Yosemite because it helps him clear his mind after stressful work weeks"
-BAD: "Bob hikes in Yosemite" (missing frequency, reason, and context)
+Input: "Yesterday Bob went hiking in Yosemite because it helps him clear his mind."
+GOOD fact: "Bob went hiking in Yosemite because it helps him clear his mind"
+GOOD date: Reference date minus 1 day
 
-Input: "The new algorithm reduced latency by 40% compared to the baseline by using a novel caching strategy."
-GOOD: "The new algorithm reduced latency by 40% compared to the baseline by using a novel caching strategy"
-BAD: "The algorithm is faster" (missing numbers, comparison, and method)
+Input: "Here's a photo of me with my friends taken last week at the beach."
+GOOD fact: "Someone shared/took a photo with their friends at the beach"
+GOOD date: Reference date minus 7 days (last week)
+NOTE: Extract the event (photo taken/shared with friends at beach), NOT just that a photo exists
+
+Input: "I sent you that article about AI last Tuesday."
+GOOD fact: "Someone sent an article about AI"
+GOOD date: Calculate last Tuesday from reference date
 
 ## TEXT TO EXTRACT FROM:
 {chunk}
 
-Remember: Include ALL details, names, numbers, reasons, and context. Facts should be rich and informative, not summaries."""
+Remember:
+1. BE EXHAUSTIVE - Extract EVERY event, action, and fact mentioned
+2. DO NOT skip casual mentions like "here's a photo", "I was with X", "sent you Y"
+3. Include ALL details, names, numbers, reasons, and context in the fact text
+4. Extract the absolute date for EACH fact by calculating relative times from the reference date
+5. When in doubt, EXTRACT IT - better to have too many facts than miss important events"""
 
-        # Use parse() for structured outputs with Pydantic models
-        response = await client.beta.chat.completions.parse(
+    response = await client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an EXHAUSTIVE fact extractor. Extract EVERY event, action, and fact mentioned - never skip anything. This includes casual mentions like photos shared, things sent, meetups, gatherings, or any action. Preserve all context, details, and nuances. Calculate absolute dates from relative time expressions. When in doubt, extract it - missing facts is worse than extracting too many."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+        response_format=FactExtractionResponse,
+        extra_body={"service_tier": "auto"},
+    )
+
+    # Extract the parsed response
+    extraction_response = response.choices[0].message.parsed
+
+    # Convert to dict format
+    chunk_facts = [fact.model_dump() for fact in extraction_response.facts]
+
+    return chunk_facts
+
+
+async def extract_facts_from_text(
+    text: str,
+    event_date: datetime,
+    context: str = "",
+    model: str = "openai/gpt-oss-120b",
+    temperature: float = 0.1,
+    max_tokens: int = 65000,
+    chunk_size: int = 5000
+) -> List[Dict[str, str]]:
+    """
+    Extract semantic facts from conversational or narrative text using LLM.
+
+    For large texts (>chunk_size chars), automatically chunks at sentence boundaries
+    to avoid hitting output token limits. Processes ALL chunks in PARALLEL for speed.
+
+    Args:
+        text: Input text (conversation, article, etc.)
+        event_date: Reference date for resolving relative times
+        context: Context about the conversation/document
+        model: LLM model to use
+        temperature: Sampling temperature (lower = more focused)
+        max_tokens: Maximum tokens in response
+        chunk_size: Maximum characters per chunk
+
+    Returns:
+        List of fact dictionaries with 'fact' and 'date' keys
+    """
+    client = get_llm_client()
+
+    # Chunk text if necessary
+    chunks = chunk_text(text, max_chars=chunk_size)
+
+    # Process all chunks in parallel using asyncio.gather
+    tasks = [
+        _extract_facts_from_chunk(
+            chunk=chunk,
+            chunk_index=i,
+            total_chunks=len(chunks),
+            event_date=event_date,
+            context=context,
             model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You extract detailed, comprehensive facts from text. Preserve all context, details, and nuances. Never summarize or shorten - include everything relevant."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
             temperature=temperature,
             max_tokens=max_tokens,
-            response_format=FactExtractionResponse
+            client=client
         )
+        for i, chunk in enumerate(chunks)
+    ]
 
-        # Extract the parsed response
-        extraction_response = response.choices[0].message.parsed
+    # Wait for all chunks to complete in parallel
+    chunk_results = await asyncio.gather(*tasks)
 
-        # Convert to dict format and add to aggregate
-        chunk_facts = [fact.model_dump() for fact in extraction_response.facts]
+    # Flatten results from all chunks
+    all_facts = []
+    for chunk_facts in chunk_results:
         all_facts.extend(chunk_facts)
-
-        # Log progress for large documents
-        if len(chunks) > 1:
-            print(f"Processed chunk {i + 1}/{len(chunks)}: extracted {len(chunk_facts)} facts")
 
     return all_facts

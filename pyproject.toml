@@ -15,10 +15,9 @@ dependencies = [
     "matplotlib>=3.7.0",
     "rich>=13.0.0",
     "spacy>=3.7.0",
-    "pyvis>=0.3.0",
     "sentence-transformers>=2.2.0",
     "torch>=2.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "fastcoref>=2.1.0",
+    "langchain-text-splitters>=0.3.0",
 ]

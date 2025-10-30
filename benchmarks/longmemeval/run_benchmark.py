@@ -22,6 +22,7 @@ from typing import Dict, List, Any
 from pathlib import Path
 import time
 import asyncio
+import subprocess
 from dotenv import load_dotenv
 
 # Load environment variables from .env
@@ -72,6 +73,43 @@ def parse_args():
         help="Number of memory units to retrieve per query"
     )
     return parser.parse_args()
+
+
+def download_dataset(dataset_path: Path) -> bool:
+    """
+    Download the LongMemEval dataset if it doesn't exist.
+
+    Returns:
+        True if successful, False otherwise
+    """
+    url = "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json"
+
+    console.print(f"[yellow]Dataset not found. Downloading from HuggingFace...[/yellow]")
+    console.print(f"[dim]URL: {url}[/dim]")
+    console.print(f"[dim]Destination: {dataset_path}[/dim]")
+
+    try:
+        # Use curl to download with progress
+        result = subprocess.run(
+            ["curl", "-L", "-o", str(dataset_path), url],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+
+        if result.returncode == 0 and dataset_path.exists():
+            console.print(f"[green]✓ Dataset downloaded successfully[/green]")
+            return True
+        else:
+            console.print(f"[red]✗ Download failed: {result.stderr}[/red]")
+            return False
+
+    except subprocess.TimeoutExpired:
+        console.print(f"[red]✗ Download timed out after 5 minutes[/red]")
+        return False
+    except Exception as e:
+        console.print(f"[red]✗ Download error: {e}[/red]")
+        return False
 
 
 def load_dataset(dataset_path: str) -> List[Dict[str, Any]]:
@@ -158,7 +196,7 @@ async def ingest_conversation(memory: TemporalSemanticMemory, agent_id: str, ins
                 console.print(f"[yellow]Warning: Failed to ingest session {session_id}: {e}[/yellow]")
 
 
-def retrieve_memories(
+async def retrieve_memories(
     memory: TemporalSemanticMemory,
     agent_id: str,
     query: str,
@@ -179,7 +217,7 @@ def retrieve_memories(
         List of retrieved memory units
     """
     try:
-        results = memory.search(
+        results = await memory.search_async(
             agent_id=agent_id,
             query=query,
             thinking_budget=thinking_budget,
@@ -323,12 +361,13 @@ def run_benchmark(args):
     """Run the LongMemEval benchmark evaluation."""
     console.print("\n[bold cyan]LongMemEval Benchmark Evaluation[/bold cyan]\n")
 
-    # Load dataset
+    # Load dataset - download if needed
     dataset_path = Path(__file__).parent / "longmemeval_s_cleaned.json"
     if not dataset_path.exists():
-        console.print(f"[red]Error: Dataset not found at {dataset_path}[/red]")
-        console.print("[yellow]Run: curl -L 'https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json' -o longmemeval_s_cleaned.json[/yellow]")
-        return
+        if not download_dataset(dataset_path):
+            console.print(f"[red]Failed to download dataset. Please download manually:[/red]")
+            console.print("[yellow]curl -L 'https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json' -o benchmarks/longmemeval/longmemeval_s_cleaned.json[/yellow]")
+            return
 
     console.print(f"[green]Loading dataset from {dataset_path}[/green]")
     dataset = load_dataset(dataset_path)
@@ -374,8 +413,11 @@ def run_benchmark(args):
 
             progress.update(instance_task, description=f"[cyan]Instance {idx+1}/{len(dataset)}: {question_id}")
 
-            # Create unique agent ID for this instance
-            agent_id = f"longmemeval_{question_id}"
+            # Use single agent for all LongMemEval data (cleared per question for isolation)
+            agent_id = "longmemeval"
+
+            # Clear agent data for this question (each question needs fresh isolated context)
+            memory.delete_agent(agent_id)
 
             # Ingest conversation history
             try:
@@ -385,13 +427,13 @@ def run_benchmark(args):
                 continue
 
             # Retrieve memories
-            memories = retrieve_memories(
+            memories = asyncio.run(retrieve_memories(
                 memory,
                 agent_id,
                 question,
                 args.thinking_budget,
                 args.top_k
-            )
+            ))
 
             # Generate answer
             predicted_answer = generate_answer(client, question, memories)

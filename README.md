@@ -90,43 +90,44 @@ The combination of these three networks enables powerful memory retrieval that g
 
 The search algorithm explores the memory graph using spreading activation:
 
-1. **Entry Points**: Find top-3 semantically similar memories to the query (vector search)
-2. **Activation Spreading**: Start with activation = 1.0 at entry points
+1. **Entry Points**: Find top-3 semantically similar memories to the query (vector search, similarity ≥ 0.5)
+2. **Activation Spreading**: Start with activation = actual similarity score (0.5 to 1.0) at entry points
 3. **Graph Traversal**: Follow links to neighbors, spreading activation with decay (0.8 factor)
 4. **Thinking Budget**: Limit exploration to N units (controls computational cost)
-5. **Dynamic Weighting**: Combine activation with recency and frequency:
+5. **Dynamic Weighting**: Combine activation, semantic similarity, recency, and frequency:
    ```
-   final_weight = activation × recency × frequency
+   final_weight = 0.30 × activation + 0.30 × semantic_similarity + 0.25 × recency + 0.15 × frequency
 
+   semantic_similarity = cosine_similarity(query_embedding, memory_embedding)
    recency = exp(-0.1 × days_since)
-   frequency = 1.0 + log(access_count + 1) / log(10)
+   frequency = normalized to [0, 1] from log(access_count + 1) / log(10)
    ```
 6. **Return Top-K**: Sort by final weight and return top results
 
 This approach ensures:
-- Recently accessed memories get boosted (recency bias)
-- Frequently accessed memories get boosted (importance signal)
-- Graph structure influences results (not just vector similarity)
+- Semantic relevance to query is always considered (30% weight)
+- Graph structure influences results through activation (30% weight)
+- Recently accessed memories get boosted (25% weight - recency bias)
+- Frequently accessed memories get boosted (15% weight - importance signal)
 
 ### Self-Contained Memory Units
 
-Every memory unit is processed to be self-contained through coreference resolution:
+Every memory unit is self-contained through LLM fact extraction:
 
 **Problem**: "She joined Google last year" - unclear who "she" is
 
-**Solution**: Fast batch coreference resolution that:
-- Replaces personal pronouns (he, she, it, they) with actual referents
-- Processes all sentences in one batch (O(n) instead of O(n²))
-- Uses neural coreference model for high accuracy
-- Provides fallback to custom spaCy-based resolution if needed
+**Solution**: LLM-based fact extraction that:
+- Resolves pronouns to actual referents during extraction
+- Makes facts readable without original context
+- Includes all relevant details (WHO, WHAT, WHERE, WHEN, WHY, HOW)
+- Processes facts in parallel for speed
 
 **Result**: "Alice joined Google last year" - fully self-contained
 
 **Technology**:
-- **FastCoref** - Fast, accurate neural coreference resolution
-- Processes 2.8K documents in 25 seconds on GPU
-- Significant speedup over sequential spaCy approach
-- Fallback to custom spaCy implementation if needed
+- LLM fact extraction with detailed prompts for pronoun resolution
+- Structured output using Pydantic models
+- Batch processing for efficiency
 
 ### LLM-Based Fact Extraction
 
@@ -165,9 +166,8 @@ Raw content is processed through an LLM to extract meaningful facts before stora
 - `psycopg2-binary` - PostgreSQL client
 - `sentence-transformers` - Local embedding model (bge-small-en-v1.5)
 - `torch` - Deep learning framework (for embeddings)
-- `fastcoref` - Fast neural coreference resolution
 - `spacy` - NLP (NER, dependency parsing, tokenization)
-- `nltk` - Sentence tokenization
+- `langchain-text-splitters` - Intelligent text chunking
 - `networkx` - Graph operations
 - `pyvis` - Interactive HTML graph visualization
 - `matplotlib` - Static graph visualization
@@ -247,7 +247,7 @@ memory-poc/
 ├── memory/                          # Core memory system package
 │   ├── temporal_semantic_memory.py  # Main memory system class
 │   ├── entity_resolver.py           # Entity extraction and disambiguation
-│   ├── coref_resolver.py            # Coreference resolution
+│   ├── llm_client.py                # LLM-based fact extraction
 │   └── utils.py                     # Utility functions
 │
 ├── demos/                           # Demo scripts

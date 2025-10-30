@@ -48,6 +48,43 @@ def extract_entities(text: str) -> List[Dict[str, any]]:
     return entities
 
 
+def extract_entities_batch(texts: List[str]) -> List[List[Dict[str, any]]]:
+    """
+    Extract entities from multiple texts in batch (MUCH faster than sequential).
+
+    Uses spaCy's nlp.pipe() for efficient batch processing.
+
+    Args:
+        texts: List of input texts
+
+    Returns:
+        List of entity lists, one per input text
+    """
+    if not texts:
+        return []
+
+    nlp = get_nlp()
+
+    # Process all texts in batch using nlp.pipe (significantly faster!)
+    docs = list(nlp.pipe(texts, batch_size=50))
+
+    all_entities = []
+    for doc in docs:
+        entities = []
+        for ent in doc.ents:
+            # Filter to important entity types
+            if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC', 'PRODUCT', 'EVENT']:
+                entities.append({
+                    'text': ent.text,
+                    'type': ent.label_,
+                    'start': ent.start_char,
+                    'end': ent.end_char,
+                })
+        all_entities.append(entities)
+
+    return all_entities
+
+
 class EntityResolver:
     """
     Resolves entities to canonical IDs with disambiguation.
@@ -61,6 +98,161 @@ class EntityResolver:
             db_conn: psycopg2 database connection
         """
         self.conn = db_conn
+
+    def resolve_entities_batch(
+        self,
+        agent_id: str,
+        entities_data: List[Dict],
+        context: str,
+        unit_event_date,
+    ) -> List[str]:
+        """
+        Resolve multiple entities in batch (MUCH faster than sequential).
+
+        Groups entities by type, queries candidates in bulk, and resolves
+        all entities with minimal DB queries.
+
+        Args:
+            agent_id: Agent ID
+            entities_data: List of dicts with 'text', 'type', 'nearby_entities'
+            context: Context where entities appear
+            unit_event_date: When this unit was created
+
+        Returns:
+            List of entity IDs in same order as input
+        """
+        if not entities_data:
+            return []
+
+        cursor = self.conn.cursor()
+
+        try:
+            import time
+            start = time.time()
+
+            # Group entities by type for efficient querying
+            entities_by_type = {}
+            for idx, entity_data in enumerate(entities_data):
+                entity_type = entity_data['type']
+                if entity_type not in entities_by_type:
+                    entities_by_type[entity_type] = []
+                entities_by_type[entity_type].append((idx, entity_data))
+
+            # Query ALL candidates for each type in batch
+            all_candidates = {}  # Maps (entity_type, entity_text) -> list of candidates
+            for entity_type, entities_list in entities_by_type.items():
+                # Extract unique entity texts for this type
+                entity_texts = list(set(e[1]['text'] for e in entities_list))
+
+                # Query candidates for all texts at once
+                from psycopg2.extras import execute_values
+                cursor.execute(
+                    """
+                    SELECT canonical_name, id, metadata, last_seen, mention_count
+                    FROM entities
+                    WHERE agent_id = %s AND entity_type = %s
+                    """,
+                    (agent_id, entity_type)
+                )
+                type_candidates = cursor.fetchall()
+
+                # Filter candidates in memory (faster than complex SQL for small datasets)
+                for entity_text in entity_texts:
+                    matching = []
+                    entity_text_lower = entity_text.lower()
+                    for canonical_name, ent_id, metadata, last_seen, mention_count in type_candidates:
+                        canonical_lower = canonical_name.lower()
+                        # Same matching logic as before
+                        if (entity_text_lower == canonical_lower or
+                            entity_text_lower in canonical_lower or
+                            canonical_lower in entity_text_lower):
+                            matching.append((ent_id, canonical_name, metadata, last_seen, mention_count))
+                    all_candidates[(entity_type, entity_text)] = matching
+
+            # Resolve each entity using pre-fetched candidates
+            entity_ids = [None] * len(entities_data)
+            entities_to_update = []  # (entity_id, unit_event_date)
+            entities_to_create = []  # (idx, entity_data)
+
+            for idx, entity_data in enumerate(entities_data):
+                entity_text = entity_data['text']
+                entity_type = entity_data['type']
+                nearby_entities = entity_data.get('nearby_entities', [])
+
+                candidates = all_candidates.get((entity_type, entity_text), [])
+
+                if not candidates:
+                    # Will create new entity
+                    entities_to_create.append((idx, entity_data))
+                    continue
+
+                # Score candidates (same logic as before but with pre-fetched data)
+                best_candidate = None
+                best_score = 0.0
+                best_name_similarity = 0.0
+
+                nearby_entity_set = {e['text'].lower() for e in nearby_entities if e['text'] != entity_text}
+
+                for candidate_id, canonical_name, metadata, last_seen, mention_count in candidates:
+                    score = 0.0
+
+                    # Name similarity
+                    name_similarity = SequenceMatcher(
+                        None,
+                        entity_text.lower(),
+                        canonical_name.lower()
+                    ).ratio()
+                    score += name_similarity * 0.5
+
+                    # Temporal proximity
+                    if last_seen:
+                        days_diff = abs((unit_event_date - last_seen).total_seconds() / 86400)
+                        if days_diff < 7:
+                            temporal_score = max(0, 1.0 - (days_diff / 7))
+                            score += temporal_score * 0.2
+
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = candidate_id
+                        best_name_similarity = name_similarity
+
+                # Apply threshold
+                threshold = 0.4 if entity_type == 'PERSON' and best_name_similarity >= 0.95 else 0.6
+
+                if best_score > threshold:
+                    entity_ids[idx] = best_candidate
+                    entities_to_update.append((best_candidate, unit_event_date))
+                else:
+                    entities_to_create.append((idx, entity_data))
+
+            # Batch update existing entities
+            if entities_to_update:
+                from psycopg2.extras import execute_values
+                execute_values(
+                    cursor,
+                    """
+                    UPDATE entities SET
+                        mention_count = mention_count + 1,
+                        last_seen = data.last_seen
+                    FROM (VALUES %s) AS data(id, last_seen)
+                    WHERE entities.id = data.id::uuid
+                    """,
+                    entities_to_update
+                )
+
+            # Batch create new entities
+            if entities_to_create:
+                for idx, entity_data in entities_to_create:
+                    entity_id = self._create_entity(
+                        cursor, agent_id, entity_data['text'],
+                        entity_data['type'], unit_event_date
+                    )
+                    entity_ids[idx] = entity_id
+
+            return entity_ids
+
+        finally:
+            cursor.close()
 
     def resolve_entity(
         self,
@@ -296,6 +488,75 @@ class EntityResolver:
             """,
             (entity_id_1, entity_id_2)
         )
+
+    def link_units_to_entities_batch(self, unit_entity_pairs: List[tuple[str, str]]):
+        """
+        Link multiple memory units to entities in batch (MUCH faster than sequential).
+
+        Also updates co-occurrence cache for entities that appear in the same unit.
+
+        Args:
+            unit_entity_pairs: List of (unit_id, entity_id) tuples
+        """
+        if not unit_entity_pairs:
+            return
+
+        cursor = self.conn.cursor()
+        try:
+            # Batch insert all unit-entity links
+            from psycopg2.extras import execute_values
+            execute_values(
+                cursor,
+                """
+                INSERT INTO unit_entities (unit_id, entity_id)
+                VALUES %s
+                ON CONFLICT DO NOTHING
+                """,
+                unit_entity_pairs
+            )
+
+            # Build map of unit -> entities for co-occurrence calculation
+            # Use sets to avoid duplicate entities in the same unit
+            unit_to_entities = {}
+            for unit_id, entity_id in unit_entity_pairs:
+                if unit_id not in unit_to_entities:
+                    unit_to_entities[unit_id] = set()
+                unit_to_entities[unit_id].add(entity_id)
+
+            # Update co-occurrences for all pairs in each unit
+            cooccurrence_pairs = set()  # Use set to avoid duplicates
+            for unit_id, entity_ids in unit_to_entities.items():
+                entity_list = list(entity_ids)  # Convert set to list for iteration
+                # For each pair of entities in this unit, create co-occurrence
+                for i, entity_id_1 in enumerate(entity_list):
+                    for entity_id_2 in entity_list[i+1:]:
+                        # Skip if same entity (shouldn't happen with set, but be safe)
+                        if entity_id_1 == entity_id_2:
+                            continue
+                        # Ensure consistent ordering (entity_id_1 < entity_id_2)
+                        if entity_id_1 > entity_id_2:
+                            entity_id_1, entity_id_2 = entity_id_2, entity_id_1
+                        cooccurrence_pairs.add((entity_id_1, entity_id_2))
+
+            # Batch update co-occurrences
+            if cooccurrence_pairs:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO entity_cooccurrences (entity_id_1, entity_id_2, cooccurrence_count, last_cooccurred)
+                    VALUES %s
+                    ON CONFLICT (entity_id_1, entity_id_2)
+                    DO UPDATE SET
+                        cooccurrence_count = entity_cooccurrences.cooccurrence_count + 1,
+                        last_cooccurred = EXCLUDED.last_cooccurred
+                    """,
+                    [(e1, e2, 1, now) for e1, e2 in cooccurrence_pairs]
+                )
+
+        finally:
+            cursor.close()
 
     def get_units_by_entity(self, entity_id: str, limit: int = 100) -> List[str]:
         """

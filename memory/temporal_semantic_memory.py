@@ -18,19 +18,59 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import asyncio
 import time
+from concurrent.futures import ProcessPoolExecutor
+import numpy as np
 
 from .utils import (
     extract_facts,
     calculate_recency_weight,
     calculate_frequency_weight,
 )
-from .entity_resolver import EntityResolver, extract_entities
-from .coref_resolver import resolve_sentences
+from .entity_resolver import EntityResolver
 
 
 def utcnow():
     """Get current UTC time with timezone info."""
     return datetime.now(timezone.utc)
+
+
+# Global process pool for parallel embedding generation
+# Each process loads its own copy of the embedding model
+# This provides TRUE parallelism for CPU-bound embedding operations
+_PROCESS_POOL = None
+_EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+
+# Process-local model cache (one per worker process)
+_worker_model = None
+
+
+def _get_worker_model():
+    """Get or load the embedding model in worker process."""
+    global _worker_model
+    if _worker_model is None:
+        _worker_model = SentenceTransformer(_EMBEDDING_MODEL_NAME)
+    return _worker_model
+
+
+def _encode_batch_worker(texts: List[str]) -> List[List[float]]:
+    """
+    Worker function for process pool - encodes texts to embeddings.
+
+    This function runs in a separate process and loads its own model.
+    """
+    model = _get_worker_model()
+    embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    return [emb.tolist() for emb in embeddings]
+
+
+def _get_process_pool():
+    """Get or create the global process pool."""
+    global _PROCESS_POOL
+    if _PROCESS_POOL is None:
+        # Use 4 worker processes for true parallelism
+        # Adjust based on your CPU cores (each process loads ~500MB model)
+        _PROCESS_POOL = ProcessPoolExecutor(max_workers=4)
+    return _PROCESS_POOL
 
 
 class TemporalSemanticMemory:
@@ -94,11 +134,13 @@ class TemporalSemanticMemory:
 
     async def _generate_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """
-        Generate embeddings for multiple texts using local model (batch processing).
+        Generate embeddings for multiple texts using local model in parallel.
 
-        Local models are fast and process batches efficiently without needing
-        parallel API calls. We run this in asyncio to avoid blocking, but the
-        actual embedding generation is synchronous.
+        Uses a ProcessPoolExecutor to achieve TRUE parallelism for CPU-bound
+        embedding generation. Each worker process loads its own model copy.
+
+        When multiple put_async calls run in parallel, each can generate
+        embeddings concurrently in separate processes (no GIL contention).
 
         Args:
             texts: List of texts to embed
@@ -107,13 +149,15 @@ class TemporalSemanticMemory:
             List of 384-dimensional embeddings in same order as input texts
         """
         try:
-            # Run in thread pool to avoid blocking event loop
+            # Run in process pool for true parallelism
             loop = asyncio.get_event_loop()
+            pool = _get_process_pool()
             embeddings = await loop.run_in_executor(
-                None,
-                lambda: self.embedding_model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+                pool,
+                _encode_batch_worker,
+                texts
             )
-            return [emb.tolist() for emb in embeddings]
+            return embeddings
         except Exception as e:
             raise Exception(f"Failed to generate batch embeddings: {str(e)}")
 
@@ -208,14 +252,7 @@ class TemporalSemanticMemory:
         """
         Store content as memory units with temporal and semantic links (ASYNC version).
 
-        This async version generates ALL embeddings in parallel for maximum speed,
-        then uses batch inserts for database operations.
-
-        Steps:
-        1. Split content into sentence units
-        2. Resolve coreferences
-        3. **Generate ALL embeddings in parallel** (FAST!)
-        4. **Batch insert all units and links** (FAST!)
+        This is a convenience wrapper around put_batch_async for a single content item.
 
         Args:
             agent_id: Unique identifier for the agent
@@ -226,131 +263,212 @@ class TemporalSemanticMemory:
         Returns:
             List of created unit IDs
         """
+        # Use put_batch_async with a single item (avoids code duplication)
+        result = await self.put_batch_async(
+            agent_id=agent_id,
+            contents=[{
+                "content": content,
+                "context": context,
+                "event_date": event_date
+            }]
+        )
+
+        # Return the first (and only) list of unit IDs
+        return result[0] if result else []
+
+    async def put_batch_async(
+        self,
+        agent_id: str,
+        contents: List[Dict[str, Any]],
+    ) -> List[List[str]]:
+        """
+        Store multiple content items as memory units in ONE batch operation.
+
+        This is MUCH more efficient than calling put_async multiple times:
+        - Extracts facts from all contents in parallel
+        - Generates ALL embeddings in ONE batch
+        - Does ALL database operations in ONE transaction
+
+        Args:
+            agent_id: Unique identifier for the agent
+            contents: List of dicts with keys:
+                - "content" (required): Text content to store
+                - "context" (optional): Context about the memory
+                - "event_date" (optional): When the event occurred
+
+        Returns:
+            List of lists of unit IDs (one list per content item)
+
+        Example:
+            unit_ids = await memory.put_batch_async(
+                agent_id="user123",
+                contents=[
+                    {"content": "Alice works at Google", "context": "conversation"},
+                    {"content": "Bob loves Python", "context": "conversation"},
+                ]
+            )
+            # Returns: [["unit-id-1"], ["unit-id-2"]]
+        """
         start_time = time.time()
         print(f"\n{'='*60}")
-        print(f"PUT_ASYNC START: {agent_id}")
-        print(f"Content length: {len(content)} chars")
+        print(f"PUT_BATCH_ASYNC START: {agent_id}")
+        print(f"Batch size: {len(contents)} content items")
         print(f"{'='*60}")
 
-        if event_date is None:
-            event_date = utcnow()
-
-        # Step 1: Extract semantic facts using LLM (async)
-        step_start = time.time()
-        try:
-            facts = await extract_facts(content)
-            print(f"[1] Extract facts: {len(facts)} facts in {time.time() - step_start:.3f}s")
-        except Exception as e:
-            print(f"\n{'='*60}")
-            print(f"PUT_ASYNC FAILED: Fact extraction error")
-            print(f"Error: {e}")
-            print(f"{'='*60}\n")
-            raise Exception(f"Failed to extract facts from content: {e}")
-
-        # Step 2: Resolve pronouns to make facts even more self-contained
-        step_start = time.time()
-        sentences = resolve_sentences(facts)
-        print(f"[2] Resolve coreferences: {time.time() - step_start:.3f}s")
-
-        # Step 3: Generate ALL embeddings in parallel
-        step_start = time.time()
-        embeddings = await self._generate_embeddings_batch(sentences)
-        print(f"[3] Generate embeddings (parallel): {len(embeddings)} embeddings in {time.time() - step_start:.3f}s")
-
-        # Step 4: Check for duplicates using similarity + temporal window
-        cursor = self.conn.cursor()
-        step_start = time.time()
-        duplicate_flags = self._find_duplicate_facts_batch(
-            cursor, agent_id, sentences, embeddings, event_date
-        )
-        num_duplicates = sum(duplicate_flags)
-
-        # Filter out duplicates
-        filtered_data = [
-            (sentence, embedding)
-            for sentence, embedding, is_dup in zip(sentences, embeddings, duplicate_flags)
-            if not is_dup
-        ]
-
-        if filtered_data:
-            sentences, embeddings = zip(*filtered_data)
-            sentences = list(sentences)
-            embeddings = list(embeddings)
-        else:
-            sentences = []
-            embeddings = []
-
-        print(f"[4] Deduplication check: {num_duplicates} duplicates filtered, {len(sentences)} new facts in {time.time() - step_start:.3f}s")
-
-        # If all facts were duplicates, return empty list
-        if not sentences:
-            cursor.close()
-            print(f"\n{'='*60}")
-            print(f"PUT_ASYNC COMPLETE: All facts were duplicates, nothing stored")
-            print(f"{'='*60}\n")
+        if not contents:
             return []
 
-        # Step 5: Batch insert everything
+        # Step 1: Extract facts from ALL contents in parallel
+        step_start = time.time()
+
+        # Create tasks for parallel fact extraction
+        fact_extraction_tasks = []
+        for item in contents:
+            content = item["content"]
+            context = item.get("context", "")
+            event_date = item.get("event_date") or utcnow()
+
+            task = extract_facts(content, event_date, context)
+            fact_extraction_tasks.append((task, event_date, context))
+
+        # Wait for all fact extractions to complete
+        all_fact_results = await asyncio.gather(*[task for task, _, _ in fact_extraction_tasks])
+
+        # Flatten and track which facts belong to which content
+        all_fact_texts = []
+        all_fact_dates = []
+        all_contexts = []
+        content_boundaries = []  # [(start_idx, end_idx), ...]
+
+        current_idx = 0
+        for i, ((_, event_date, context), fact_dicts) in enumerate(zip(fact_extraction_tasks, all_fact_results)):
+            start_idx = current_idx
+
+            for fact_dict in fact_dicts:
+                all_fact_texts.append(fact_dict['fact'])
+                try:
+                    from dateutil import parser as date_parser
+                    fact_date = date_parser.isoparse(fact_dict['date'])
+                    all_fact_dates.append(fact_date)
+                except Exception:
+                    all_fact_dates.append(event_date)
+                all_contexts.append(context)
+
+            end_idx = current_idx + len(fact_dicts)
+            content_boundaries.append((start_idx, end_idx))
+            current_idx = end_idx
+
+        total_facts = len(all_fact_texts)
+
+        if total_facts == 0:
+            return [[] for _ in contents]
+
+        # Step 2: Generate ALL embeddings in ONE batch (HUGE speedup!)
+        step_start = time.time()
+        all_embeddings = await self._generate_embeddings_batch(all_fact_texts)
+        print(f"[2] Generate embeddings (parallel): {len(all_embeddings)} embeddings in {time.time() - step_start:.3f}s")
+
+        # Step 3: Process everything in ONE database transaction
+        cursor = self.conn.cursor()
         try:
-            # Batch INSERT all memory units
+            # Deduplication check for all facts
+            step_start = time.time()
+            all_is_duplicate = []
+            for sentence, embedding, fact_date in zip(all_fact_texts, all_embeddings, all_fact_dates):
+                dup_flags = self._find_duplicate_facts_batch(
+                    cursor, agent_id, [sentence], [embedding], fact_date
+                )
+                all_is_duplicate.extend(dup_flags)
+
+            duplicates_filtered = sum(all_is_duplicate)
+            new_facts = total_facts - duplicates_filtered
+            print(f"[3] Deduplication check: {duplicates_filtered} duplicates filtered, {new_facts} new facts in {time.time() - step_start:.3f}s")
+
+            # Filter out duplicates
+            filtered_sentences = [s for s, is_dup in zip(all_fact_texts, all_is_duplicate) if not is_dup]
+            filtered_embeddings = [e for e, is_dup in zip(all_embeddings, all_is_duplicate) if not is_dup]
+            filtered_dates = [d for d, is_dup in zip(all_fact_dates, all_is_duplicate) if not is_dup]
+            filtered_contexts = [c for c, is_dup in zip(all_contexts, all_is_duplicate) if not is_dup]
+
+            if not filtered_sentences:
+                print(f"[PUT_BATCH_ASYNC] All facts were duplicates, returning empty")
+                return [[] for _ in contents]
+
+            # Batch insert ALL units
             step_start = time.time()
             from psycopg2.extras import execute_values
             unit_data = [
-                (agent_id, sentence, embedding, context, event_date, 0)
-                for sentence, embedding in zip(sentences, embeddings)
+                (agent_id, sentence, context, embedding, date, 0)  # access_count starts at 0
+                for sentence, context, embedding, date in zip(
+                    filtered_sentences, filtered_contexts, filtered_embeddings, filtered_dates
+                )
             ]
 
-            unit_ids = execute_values(
+            results = execute_values(
                 cursor,
                 """
-                INSERT INTO memory_units (agent_id, text, embedding, context, event_date, access_count)
+                INSERT INTO memory_units (agent_id, text, context, embedding, event_date, access_count)
                 VALUES %s
                 RETURNING id
                 """,
                 unit_data,
                 fetch=True
             )
-            created_unit_ids = [str(row[0]) for row in unit_ids]
-            print(f"[5] Batch insert units: {time.time() - step_start:.3f}s")
 
-            # Process entities for all units
-            step_start = time.time()
-            all_entity_links = []
-            for unit_id, sentence in zip(created_unit_ids, sentences):
-                entity_links = self._extract_entities_for_batch(cursor, agent_id, unit_id, sentence, context, event_date, sentences)
-                all_entity_links.extend(entity_links)
-            print(f"[6] Extract entities: {time.time() - step_start:.3f}s")
+            created_unit_ids = [str(row[0]) for row in results]
+            print(f"[5] Batch insert units: {len(created_unit_ids)} units in {time.time() - step_start:.3f}s")
 
-            # Create ALL temporal links in batch
+            # Process entities for ALL units
             step_start = time.time()
-            self._create_temporal_links_batch(cursor, agent_id, created_unit_ids, event_date)
+            all_entity_links = self._extract_entities_batch_optimized(
+                cursor, agent_id, created_unit_ids, filtered_sentences, "", filtered_dates
+            )
+            print(f"[6] Extract entities (batched): {time.time() - step_start:.3f}s")
+
+            # Create temporal links
+            step_start = time.time()
+            self._create_temporal_links_batch_per_fact(cursor, agent_id, created_unit_ids)
             print(f"[7] Batch create temporal links: {time.time() - step_start:.3f}s")
 
-            # Create ALL semantic links in batch
+            # Create semantic links
             step_start = time.time()
-            self._create_semantic_links_batch(cursor, agent_id, created_unit_ids, embeddings)
+            self._create_semantic_links_batch(cursor, agent_id, created_unit_ids, filtered_embeddings)
             print(f"[8] Batch create semantic links: {time.time() - step_start:.3f}s")
 
-            # Insert all entity links in batch
+            # Insert entity links
             step_start = time.time()
             if all_entity_links:
                 self._insert_entity_links_batch(cursor, all_entity_links)
             print(f"[9] Batch insert entity links: {time.time() - step_start:.3f}s")
 
+            # Commit everything
             commit_start = time.time()
             self.conn.commit()
             print(f"[10] Commit: {time.time() - commit_start:.3f}s")
 
+            # Map created unit IDs back to original content items
+            # Account for duplicates when mapping back
+            result_unit_ids = []
+            filtered_idx = 0
+
+            for start_idx, end_idx in content_boundaries:
+                content_unit_ids = []
+                for i in range(start_idx, end_idx):
+                    if not all_is_duplicate[i]:
+                        content_unit_ids.append(created_unit_ids[filtered_idx])
+                        filtered_idx += 1
+                result_unit_ids.append(content_unit_ids)
+
             total_time = time.time() - start_time
             print(f"\n{'='*60}")
-            print(f"PUT_ASYNC COMPLETE: {len(created_unit_ids)} units stored in {total_time:.3f}s")
+            print(f"PUT_BATCH_ASYNC COMPLETE: {len(created_unit_ids)} units from {len(contents)} contents in {total_time:.3f}s")
             print(f"{'='*60}\n")
 
-            return created_unit_ids
+            return result_unit_ids
 
         except Exception as e:
             self.conn.rollback()
-            raise Exception(f"Failed to store memory: {str(e)}")
+            raise Exception(f"Failed to store batch memory: {str(e)}")
         finally:
             cursor.close()
 
@@ -412,7 +530,11 @@ class TemporalSemanticMemory:
                 )
 
         except Exception as e:
-            print(f"Warning: Failed to create temporal links: {str(e)}")
+            print(f"ERROR: Failed to create temporal links: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise to trigger rollback at put_async level
+            raise
 
     def _create_semantic_links(
         self,
@@ -471,77 +593,11 @@ class TemporalSemanticMemory:
                 )
 
         except Exception as e:
-            print(f"Warning: Failed to create semantic links: {str(e)}")
-
-    def _extract_and_link_entities(
-        self,
-        cursor,
-        agent_id: str,
-        unit_id: str,
-        text: str,
-        context: str,
-        event_date,
-        all_sentences: List[str],
-    ):
-        """
-        Extract entities from text, resolve them, and create entity links.
-
-        Args:
-            cursor: Database cursor
-            agent_id: Agent ID
-            unit_id: Current unit ID
-            text: Unit text
-            context: Context
-            event_date: When created
-            all_sentences: All sentences from the same PUT (for context)
-        """
-        try:
-            # Extract entities from this unit
-            entities = extract_entities(text)
-
-            if not entities:
-                return
-
-            # Resolve each entity and link
-            entity_ids = []
-            for entity in entities:
-                entity_id = self.entity_resolver.resolve_entity(
-                    agent_id=agent_id,
-                    entity_text=entity['text'],
-                    entity_type=entity['type'],
-                    context=context,
-                    nearby_entities=entities,
-                    unit_event_date=event_date
-                )
-                entity_ids.append(entity_id)
-
-                # Link unit to entity
-                self.entity_resolver.link_unit_to_entity(unit_id, entity_id)
-
-            # Create entity links to other units that mention the same entities
-            for entity_id in set(entity_ids):
-                # Get other units that mention this entity
-                related_units = self.entity_resolver.get_units_by_entity(entity_id, limit=50)
-
-                # Create entity links
-                links = []
-                for related_unit_id in related_units:
-                    if str(related_unit_id) != str(unit_id):
-                        links.append((unit_id, related_unit_id, 'entity', 1.0, entity_id))
-
-                if links:
-                    execute_values(
-                        cursor,
-                        """
-                        INSERT INTO memory_links (from_unit_id, to_unit_id, link_type, weight, entity_id)
-                        VALUES %s
-                        ON CONFLICT DO NOTHING
-                        """,
-                        links
-                    )
-
-        except Exception as e:
-            print(f"Warning: Failed to extract/link entities: {str(e)}")
+            print(f"ERROR: Failed to create semantic links: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise to trigger rollback at put_async level
+            raise
 
     def search(
         self,
@@ -552,7 +608,34 @@ class TemporalSemanticMemory:
         live_tracer=None,
     ) -> List[Dict[str, Any]]:
         """
-        Search memories using spreading activation.
+        Search memories using spreading activation (synchronous wrapper).
+
+        This is a synchronous wrapper around search_async() for convenience.
+        For best performance, use search_async() directly.
+
+        Args:
+            agent_id: Agent ID to search for
+            query: Search query
+            thinking_budget: How many units to explore (computational budget)
+            top_k: Number of results to return
+            live_tracer: Optional LiveSearchTracer for visualization
+
+        Returns:
+            List of memory units with their weights, sorted by relevance
+        """
+        # Run async version synchronously
+        return asyncio.run(self.search_async(agent_id, query, thinking_budget, top_k, live_tracer))
+
+    async def search_async(
+        self,
+        agent_id: str,
+        query: str,
+        thinking_budget: int = 50,
+        top_k: int = 10,
+        live_tracer=None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search memories using spreading activation (ASYNC version).
 
         This implements the core SEARCH operation:
         1. Find entry points (most relevant units via vector search)
@@ -572,14 +655,20 @@ class TemporalSemanticMemory:
         """
         cursor = self.conn.cursor(cursor_factory=RealDictCursor)
 
+        search_start = time.time()
+        print(f"\n[SEARCH] Starting search for query: '{query[:50]}...' (thinking_budget={thinking_budget}, top_k={top_k})")
+
         try:
             # Step 1: Generate query embedding
+            step_start = time.time()
             query_embedding = self._generate_embedding(query)
+            print(f"  [1] Generate query embedding: {time.time() - step_start:.3f}s")
 
             # Step 2: Find entry points
+            step_start = time.time()
             cursor.execute(
                 """
-                SELECT id, text, context, event_date, access_count,
+                SELECT id, text, context, event_date, access_count, embedding,
                        1 - (embedding <=> %s::vector) AS similarity
                 FROM memory_units
                 WHERE agent_id = %s
@@ -592,104 +681,230 @@ class TemporalSemanticMemory:
             )
 
             entry_points = cursor.fetchall()
+            print(f"  [2] Find entry points: {len(entry_points)} found in {time.time() - step_start:.3f}s")
+
             if not entry_points:
+                print(f"[SEARCH] Complete: 0 results in {time.time() - search_start:.3f}s")
                 return []
 
             # Step 3: Spreading activation with budget
+            step_start = time.time()
             visited = set()
             results = []
             budget_remaining = thinking_budget
-            queue = [(dict(unit), 1.0, True) for unit in entry_points]  # (unit, activation, is_entry)
+            # Initialize entry points with their actual similarity scores instead of 1.0
+            queue = [(dict(unit), unit["similarity"], True) for unit in entry_points]  # (unit, activation, is_entry)
+
+            # Track substep timings
+            update_access_time = 0
+            calculate_weight_time = 0
+            query_neighbors_time = 0
+            process_neighbors_time = 0
+
+            # Process nodes in batches for efficient neighbor querying
+            BATCH_SIZE = 50
+            nodes_to_process = []  # (unit, activation, is_entry_point)
 
             while queue and budget_remaining > 0:
-                current_unit, activation, is_entry_point = queue.pop(0)
-                unit_id = str(current_unit["id"])
+                # Collect a batch of nodes to process
+                while queue and len(nodes_to_process) < BATCH_SIZE and budget_remaining > 0:
+                    current_unit, activation, is_entry_point = queue.pop(0)
+                    unit_id = str(current_unit["id"])
 
-                if unit_id in visited:
-                    continue
+                    if unit_id not in visited:
+                        visited.add(unit_id)
+                        budget_remaining -= 1
+                        nodes_to_process.append((current_unit, activation, is_entry_point))
 
-                visited.add(unit_id)
-                budget_remaining -= 1
+                if not nodes_to_process:
+                    break
 
-                # Increment access count
+                # Update access counts for batch
+                substep_start = time.time()
+                node_ids = [str(node[0]["id"]) for node in nodes_to_process]
                 cursor.execute(
-                    "UPDATE memory_units SET access_count = access_count + 1 WHERE id = %s",
-                    (unit_id,)
+                    "UPDATE memory_units SET access_count = access_count + 1 WHERE id::text = ANY(%s)",
+                    (node_ids,)
                 )
+                update_access_time += time.time() - substep_start
 
-                # Calculate combined weight
-                event_date = current_unit["event_date"]
-                days_since = (utcnow() - event_date).total_seconds() / 86400
-
-                recency_weight = calculate_recency_weight(days_since)
-                frequency_weight = calculate_frequency_weight(current_unit.get("access_count", 0))
-
-                # Combined weight: activation * recency * frequency
-                final_weight = activation * recency_weight * frequency_weight
-
-                # Notify tracer
-                if live_tracer:
-                    live_tracer.visit_node(
-                        node_id=unit_id,
-                        text=current_unit["text"],
-                        activation=activation,
-                        recency=recency_weight,
-                        frequency=frequency_weight,
-                        weight=final_weight,
-                        is_entry_point=is_entry_point,
-                    )
-                    import time
-                    time.sleep(0.15)  # Slow down for visualization
-
-                results.append({
-                    "id": unit_id,
-                    "text": current_unit["text"],
-                    "context": current_unit.get("context", ""),
-                    "event_date": event_date.isoformat(),
-                    "weight": final_weight,
-                    "activation": activation,
-                    "recency": recency_weight,
-                    "frequency": frequency_weight,
-                })
-
-                # Spread to neighbors
+                # Query neighbors for ALL nodes in batch at once
+                substep_start = time.time()
                 cursor.execute(
                     """
-                    SELECT ml.to_unit_id, ml.weight, mu.text, mu.context, mu.event_date, mu.access_count
+                    SELECT ml.from_unit_id, ml.to_unit_id, ml.weight,
+                           mu.text, mu.context, mu.event_date, mu.access_count, mu.embedding
                     FROM memory_links ml
                     JOIN memory_units mu ON ml.to_unit_id = mu.id
-                    WHERE ml.from_unit_id = %s
+                    WHERE ml.from_unit_id::text = ANY(%s)
                       AND ml.weight >= 0.1
-                    ORDER BY ml.weight DESC
+                    ORDER BY ml.from_unit_id, ml.weight DESC
                     """,
-                    (unit_id,)
+                    (node_ids,)
                 )
+                all_neighbors = cursor.fetchall()
+                query_neighbors_time += time.time() - substep_start
 
-                neighbors = cursor.fetchall()
-                for neighbor in neighbors:
-                    neighbor_id = str(neighbor["to_unit_id"])
-                    if neighbor_id not in visited:
-                        link_weight = neighbor["weight"]
-                        new_activation = activation * link_weight * 0.8  # 0.8 = decay factor
+                # Group neighbors by from_unit_id
+                substep_start = time.time()
+                neighbors_by_node = {}
+                for neighbor in all_neighbors:
+                    from_id = str(neighbor["from_unit_id"])
+                    if from_id not in neighbors_by_node:
+                        neighbors_by_node[from_id] = []
+                    neighbors_by_node[from_id].append(neighbor)
 
-                        if new_activation > 0.1:
-                            queue.append(({
-                                "id": neighbor["to_unit_id"],
-                                "text": neighbor["text"],
-                                "context": neighbor.get("context", ""),
-                                "event_date": neighbor["event_date"],
-                                "access_count": neighbor["access_count"],
-                            }, new_activation, False))  # Not an entry point
+                # Process each node in the batch
+                for current_unit, activation, is_entry_point in nodes_to_process:
+                    unit_id = str(current_unit["id"])
+
+                    # Calculate combined weight
+                    event_date = current_unit["event_date"]
+                    days_since = (utcnow() - event_date).total_seconds() / 86400
+
+                    recency_weight = calculate_recency_weight(days_since)
+                    frequency_weight = calculate_frequency_weight(current_unit.get("access_count", 0))
+
+                    # Normalize frequency to [0, 1] range
+                    frequency_normalized = (frequency_weight - 1.0) / 1.0
+
+                    # Calculate semantic similarity between query and this memory
+                    memory_embedding = current_unit.get("embedding")
+                    if memory_embedding is not None:
+                        # Cosine similarity = 1 - cosine distance
+                        query_vec = np.array(query_embedding)
+                        memory_vec = np.array(memory_embedding)
+                        # Cosine similarity
+                        dot_product = np.dot(query_vec, memory_vec)
+                        norm_query = np.linalg.norm(query_vec)
+                        norm_memory = np.linalg.norm(memory_vec)
+                        semantic_similarity = dot_product / (norm_query * norm_memory) if norm_query > 0 and norm_memory > 0 else 0.0
+                    else:
+                        semantic_similarity = 0.0
+
+                    # Combined weight: 30% activation, 30% semantic similarity, 25% recency, 15% frequency
+                    final_weight = 0.3 * activation + 0.3 * semantic_similarity + 0.25 * recency_weight + 0.15 * frequency_normalized
+
+                    # Notify tracer
+                    if live_tracer:
+                        live_tracer.visit_node(
+                            node_id=unit_id,
+                            text=current_unit["text"],
+                            activation=activation,
+                            recency=recency_weight,
+                            frequency=frequency_weight,
+                            weight=final_weight,
+                            is_entry_point=is_entry_point,
+                        )
+
+                    results.append({
+                        "id": unit_id,
+                        "text": current_unit["text"],
+                        "context": current_unit.get("context", ""),
+                        "event_date": event_date.isoformat(),
+                        "weight": final_weight,
+                        "activation": activation,
+                        "semantic_similarity": semantic_similarity,
+                        "recency": recency_weight,
+                        "frequency": frequency_weight,
+                    })
+
+                    # Spread to neighbors (from batch query results)
+                    neighbors = neighbors_by_node.get(unit_id, [])
+                    for neighbor in neighbors:
+                        neighbor_id = str(neighbor["to_unit_id"])
+                        if neighbor_id not in visited:
+                            link_weight = neighbor["weight"]
+                            new_activation = activation * link_weight * 0.8  # 0.8 = decay factor
+
+                            if new_activation > 0.1:
+                                queue.append(({
+                                    "id": neighbor["to_unit_id"],
+                                    "text": neighbor["text"],
+                                    "context": neighbor.get("context", ""),
+                                    "event_date": neighbor["event_date"],
+                                    "access_count": neighbor["access_count"],
+                                    "embedding": neighbor.get("embedding"),
+                                }, new_activation, False))  # Not an entry point
+
+                calculate_weight_time += time.time() - substep_start
+                process_neighbors_time += time.time() - substep_start
+
+                # Clear batch for next iteration
+                nodes_to_process = []
+
+            spreading_activation_time = time.time() - step_start
+            num_batches = (len(visited) + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
+            print(f"  [3] Spreading activation: {len(visited)} nodes visited in {spreading_activation_time:.3f}s")
+            print(f"      [3.1] Update access counts: {update_access_time:.3f}s")
+            print(f"      [3.2] Calculate weights: {calculate_weight_time:.3f}s")
+            print(f"      [3.3] Query neighbors: {query_neighbors_time:.3f}s ({num_batches} batched queries)")
+            print(f"      [3.4] Process neighbors: {process_neighbors_time:.3f}s")
+
+            step_start = time.time()
+            self.conn.commit()
+            print(f"  [4] Commit: {time.time() - step_start:.3f}s")
+
+            # Step 4: Sort by final weight and return top results
+            step_start = time.time()
+            results.sort(key=lambda x: x["weight"], reverse=True)
+            top_results = results[:top_k]
+            print(f"  [5] Sort and return top {top_k}: {time.time() - step_start:.3f}s")
+
+            print(f"[SEARCH] Complete: {len(top_results)} results in {time.time() - search_start:.3f}s\n")
+            return top_results
+
+        except Exception as e:
+            print(f"[SEARCH] ERROR after {time.time() - search_start:.3f}s: {str(e)}")
+            self.conn.rollback()
+            raise Exception(f"Failed to search memories: {str(e)}")
+        finally:
+            cursor.close()
+
+    def delete_agent(self, agent_id: str) -> Dict[str, int]:
+        """
+        Delete all data for a specific agent (multi-tenant cleanup).
+
+        This is much more efficient than dropping all tables and allows
+        multiple agents to coexist in the same database.
+
+        Deletes (with CASCADE):
+        - All memory units for this agent
+        - All entities for this agent
+        - All associated links, unit-entity associations, and co-occurrences
+
+        Args:
+            agent_id: Agent ID to delete
+
+        Returns:
+            Dictionary with counts of deleted items
+        """
+        cursor = self.conn.cursor()
+
+        try:
+            # Count before deletion for reporting
+            cursor.execute("SELECT COUNT(*) FROM memory_units WHERE agent_id = %s", (agent_id,))
+            units_count = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM entities WHERE agent_id = %s", (agent_id,))
+            entities_count = cursor.fetchone()[0]
+
+            # Delete memory units (cascades to unit_entities, memory_links)
+            cursor.execute("DELETE FROM memory_units WHERE agent_id = %s", (agent_id,))
+
+            # Delete entities (cascades to unit_entities, entity_cooccurrences, memory_links with entity_id)
+            cursor.execute("DELETE FROM entities WHERE agent_id = %s", (agent_id,))
 
             self.conn.commit()
 
-            # Step 4: Sort by final weight and return top results
-            results.sort(key=lambda x: x["weight"], reverse=True)
-            return results[:top_k]
+            return {
+                "memory_units_deleted": units_count,
+                "entities_deleted": entities_count
+            }
 
         except Exception as e:
             self.conn.rollback()
-            raise Exception(f"Failed to search memories: {str(e)}")
+            raise Exception(f"Failed to delete agent data: {str(e)}")
         finally:
             cursor.close()
 
@@ -743,76 +958,145 @@ class TemporalSemanticMemory:
         finally:
             cursor.close()
 
-    def _extract_entities_for_batch(
+    def _extract_entities_batch_optimized(
         self,
         cursor,
         agent_id: str,
-        unit_id: str,
-        text: str,
+        unit_ids: List[str],
+        sentences: List[str],
         context: str,
-        event_date,
-        all_sentences: List[str],
+        fact_dates: List,
     ) -> List[tuple]:
         """
-        Extract entities and return entity links (doesn't insert yet).
+        Extract entities from ALL sentences in one batch (MUCH faster than sequential).
+
+        Uses spaCy's batch processing to extract entities from all texts at once,
+        then resolves and links them in bulk.
 
         Returns list of tuples for batch insertion: (from_unit_id, to_unit_id, link_type, weight, entity_id)
         """
-        from .entity_resolver import extract_entities
+        from .entity_resolver import extract_entities_batch
 
         try:
-            # Extract entities from this unit
-            entities = extract_entities(text)
+            # Step 1: Extract entities from ALL sentences in one batch (fast!)
+            substep_start = time.time()
+            all_entities = extract_entities_batch(sentences)
+            total_entities = sum(len(ents) for ents in all_entities)
+            print(f"  [6.1] spaCy NER (batch): {total_entities} entities from {len(sentences)} sentences in {time.time() - substep_start:.3f}s")
 
-            if not entities:
-                return []
+            # Step 2: Resolve entities in BATCH (much faster!)
+            substep_start = time.time()
+            step_6_2_start = time.time()
 
-            # Resolve each entity
-            entity_ids = []
-            for entity in entities:
-                entity_id = self.entity_resolver.resolve_entity(
-                    agent_id=agent_id,
-                    entity_text=entity['text'],
-                    entity_type=entity['type'],
-                    context=context,
-                    nearby_entities=entities,
-                    unit_event_date=event_date
-                )
-                entity_ids.append(entity_id)
+            # [6.2.1] Prepare all entities for batch resolution
+            substep_6_2_1_start = time.time()
+            all_entities_flat = []
+            entity_to_unit = []  # Maps flat index to (unit_id, local_index)
 
-                # Link unit to entity (this inserts into entity_units)
-                self.entity_resolver.link_unit_to_entity(unit_id, entity_id)
+            for unit_id, entities, fact_date in zip(unit_ids, all_entities, fact_dates):
+                if not entities:
+                    continue
 
-            # Now collect entity links for batch insertion
-            # After link_unit_to_entity has been called, entity_units should exist
-            links = []
-            for entity_id in set(entity_ids):
-                # Find all other units with this entity (cursor must be fresh)
-                try:
-                    cursor.execute(
-                        """
-                        SELECT unit_id
-                        FROM unit_entities
-                        WHERE entity_id = %s AND unit_id != %s
-                        """,
-                        (entity_id, unit_id)
+                for local_idx, entity in enumerate(entities):
+                    all_entities_flat.append({
+                        'text': entity['text'],
+                        'type': entity['type'],
+                        'nearby_entities': entities,
+                    })
+                    entity_to_unit.append((unit_id, local_idx, fact_date))
+            print(f"    [6.2.1] Prepare entities: {len(all_entities_flat)} entities in {time.time() - substep_6_2_1_start:.3f}s")
+
+            # Resolve ALL entities in one batch call
+            if all_entities_flat:
+                # [6.2.2] Batch resolve entities
+                substep_6_2_2_start = time.time()
+                # Group by date for batch resolution (most will have same date)
+                entities_by_date = {}
+                for idx, (unit_id, local_idx, fact_date) in enumerate(entity_to_unit):
+                    date_key = fact_date
+                    if date_key not in entities_by_date:
+                        entities_by_date[date_key] = []
+                    entities_by_date[date_key].append((idx, all_entities_flat[idx]))
+
+                # Resolve each date group in batch
+                resolved_entity_ids = [None] * len(all_entities_flat)
+                for fact_date, entities_group in entities_by_date.items():
+                    indices = [idx for idx, _ in entities_group]
+                    entities_data = [entity_data for _, entity_data in entities_group]
+
+                    batch_resolved = self.entity_resolver.resolve_entities_batch(
+                        agent_id=agent_id,
+                        entities_data=entities_data,
+                        context=context,
+                        unit_event_date=fact_date
                     )
 
-                    related_units = cursor.fetchall()
-                    for (related_unit_id,) in related_units:
+                    for idx, entity_id in zip(indices, batch_resolved):
+                        resolved_entity_ids[idx] = entity_id
+                print(f"    [6.2.2] Resolve entities: {len(all_entities_flat)} entities in {time.time() - substep_6_2_2_start:.3f}s")
+
+                # [6.2.3] Create unit-entity links in BATCH
+                substep_6_2_3_start = time.time()
+                # Map resolved entities back to units and collect all (unit, entity) pairs
+                unit_to_entity_ids = {}
+                unit_entity_pairs = []
+                for idx, (unit_id, local_idx, fact_date) in enumerate(entity_to_unit):
+                    if unit_id not in unit_to_entity_ids:
+                        unit_to_entity_ids[unit_id] = []
+
+                    entity_id = resolved_entity_ids[idx]
+                    unit_to_entity_ids[unit_id].append(entity_id)
+                    unit_entity_pairs.append((unit_id, entity_id))
+
+                # Batch insert all unit-entity links (MUCH faster!)
+                self.entity_resolver.link_units_to_entities_batch(unit_entity_pairs)
+                print(f"    [6.2.3] Create unit-entity links (batched): {len(unit_entity_pairs)} links in {time.time() - substep_6_2_3_start:.3f}s")
+
+                print(f"  [6.2] Entity resolution (batched): {len(all_entities_flat)} entities resolved in {time.time() - step_6_2_start:.3f}s")
+            else:
+                unit_to_entity_ids = {}
+                print(f"  [6.2] Entity resolution (batched): 0 entities in {time.time() - step_6_2_start:.3f}s")
+
+            # Step 3: Create entity links between units that share entities
+            substep_start = time.time()
+            # Collect all unique entity IDs
+            all_entity_ids = set()
+            for entity_ids in unit_to_entity_ids.values():
+                all_entity_ids.update(entity_ids)
+
+            # For each entity, find all units that reference it (one query per entity)
+            entity_to_units = {}
+            for entity_id in all_entity_ids:
+                cursor.execute(
+                    """
+                    SELECT unit_id
+                    FROM unit_entities
+                    WHERE entity_id = %s
+                    """,
+                    (entity_id,)
+                )
+                entity_to_units[entity_id] = [row[0] for row in cursor.fetchall()]
+
+            # Create bidirectional links between units that share entities
+            links = []
+            for entity_id, units_with_entity in entity_to_units.items():
+                # For each pair of units with this entity, create bidirectional links
+                for i, unit_id_1 in enumerate(units_with_entity):
+                    for unit_id_2 in units_with_entity[i+1:]:
                         # Bidirectional links
-                        links.append((unit_id, related_unit_id, 'entity', 1.0, entity_id))
-                        links.append((related_unit_id, unit_id, 'entity', 1.0, entity_id))
-                except Exception as query_error:
-                    # If there's an error querying, just skip this entity
-                    print(f"Warning: Failed to query entity_units for {entity_id}: {str(query_error)}")
-                    continue
+                        links.append((unit_id_1, unit_id_2, 'entity', 1.0, entity_id))
+                        links.append((unit_id_2, unit_id_1, 'entity', 1.0, entity_id))
+
+            print(f"  [6.3] Entity link creation: {len(links)} links for {len(all_entity_ids)} unique entities in {time.time() - substep_start:.3f}s")
 
             return links
 
         except Exception as e:
-            print(f"Warning: Failed to extract entities: {str(e)}")
-            return []
+            print(f"ERROR: Failed to extract entities in batch: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise to trigger rollback at put_async level
+            raise
 
     def _create_temporal_links_batch(
         self,
@@ -870,7 +1154,89 @@ class TemporalSemanticMemory:
                 )
 
         except Exception as e:
-            print(f"Warning: Failed to create temporal links: {str(e)}")
+            print(f"ERROR: Failed to create temporal links: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise to trigger rollback at put_async level
+            raise
+
+    def _create_temporal_links_batch_per_fact(
+        self,
+        cursor,
+        agent_id: str,
+        unit_ids: List[str],
+        time_window_hours: int = 24,
+    ):
+        """
+        Create temporal links for multiple units, each with their own event_date.
+
+        Queries the event_date for each unit from the database and creates temporal
+        links based on individual dates (supports per-fact dating).
+        """
+        if not unit_ids:
+            return
+
+        try:
+            from psycopg2.extras import execute_values
+
+            # Get the event_date for each new unit
+            cursor.execute(
+                """
+                SELECT id, event_date
+                FROM memory_units
+                WHERE id::text = ANY(%s)
+                """,
+                (unit_ids,)
+            )
+            new_units = {str(row[0]): row[1] for row in cursor.fetchall()}
+
+            # Create links based on each unit's individual event_date
+            links = []
+            for unit_id, unit_event_date in new_units.items():
+                # Find units within the time window of THIS specific unit
+                cursor.execute(
+                    """
+                    SELECT id, event_date
+                    FROM memory_units
+                    WHERE agent_id = %s
+                      AND id != %s
+                      AND event_date BETWEEN %s AND %s
+                    ORDER BY event_date DESC
+                    LIMIT 10
+                    """,
+                    (
+                        agent_id,
+                        unit_id,
+                        unit_event_date - timedelta(hours=time_window_hours),
+                        unit_event_date + timedelta(hours=time_window_hours)
+                    )
+                )
+
+                recent_units = cursor.fetchall()
+
+                for recent_id, recent_event_date in recent_units:
+                    # Calculate temporal proximity weight
+                    time_diff_hours = abs((unit_event_date - recent_event_date).total_seconds() / 3600)
+                    weight = max(0.3, 1.0 - (time_diff_hours / time_window_hours))
+                    links.append((unit_id, recent_id, 'temporal', weight, None))
+
+            if links:
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO memory_links (from_unit_id, to_unit_id, link_type, weight, entity_id)
+                    VALUES %s
+                    ON CONFLICT (from_unit_id, to_unit_id, link_type, COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO NOTHING
+                    """,
+                    links
+                )
+
+        except Exception as e:
+            print(f"ERROR: Failed to create temporal links: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise to trigger rollback at put_async level
+            raise
 
     def _create_semantic_links_batch(
         self,
@@ -927,7 +1293,11 @@ class TemporalSemanticMemory:
                 )
 
         except Exception as e:
-            print(f"Warning: Failed to create semantic links: {str(e)}")
+            print(f"ERROR: Failed to create semantic links: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise to trigger rollback at put_async level
+            raise
 
     def _insert_entity_links_batch(self, cursor, links: List[tuple]):
         """Insert all entity links in a single batch."""

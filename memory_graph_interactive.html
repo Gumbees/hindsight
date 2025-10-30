@@ -1,181 +1,423 @@
+
+<!DOCTYPE html>
 <html>
-    <head>
-        <meta charset="utf-8">
-        
-            <script src="lib/bindings/utils.js"></script>
-            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/dist/vis-network.min.css" integrity="sha512-WgxfT5LWjfszlPHXRmBWHkV2eceiWTOBvrKCNbdgDYTHrT2AeLCGbF4sZlZw3UMN3WtL0tGUoIAKsu8mllg/XA==" crossorigin="anonymous" referrerpolicy="no-referrer" />
-            <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js" integrity="sha512-LnvoEWDFrqGHlHmDD2101OrLcbsfkrzoSpvtSQtxK3RMnRV0eOkhhBN2dXHKRrUU8p2DGRTk35n4O8nWSVe1mQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-            
-        
-<center>
-<h1>Entity-Aware Memory Graph - Interactive Visualization</h1>
-</center>
+<head>
+    <title>Memory Graph - Interactive Visualization</title>
+    <meta charset="utf-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <style>
+        body {
+            font-family: Tahoma, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #f5f5f5;
+        }
 
-<!-- <link rel="stylesheet" href="../node_modules/vis/dist/vis.min.css" type="text/css" />
-<script type="text/javascript" src="../node_modules/vis/dist/vis.js"> </script>-->
-        <link
-          href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/css/bootstrap.min.css"
-          rel="stylesheet"
-          integrity="sha384-eOJMYsd53ii+scO/bJGFsiCZc+5NDVN2yr8+0RDqr0Ql0h+rP48ckxlpbzKgwra6"
-          crossorigin="anonymous"
-        />
-        <script
-          src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/js/bootstrap.bundle.min.js"
-          integrity="sha384-JEW9xMcG8R+pH31jmWH6WWP0WintQrMb4s7ZOdauHnUtxwoG2vI5DkLtS3qm9Ekf"
-          crossorigin="anonymous"
-        ></script>
+        .tab-container {
+            background: white;
+        }
 
+        .tab-buttons {
+            background: #f0f0f0;
+            border-bottom: 2px solid #333;
+            padding: 0;
+            margin: 0;
+        }
 
-        <center>
-          <h1>Entity-Aware Memory Graph - Interactive Visualization</h1>
-        </center>
-        <style type="text/css">
+        .tab-button {
+            background: #e0e0e0;
+            border: none;
+            padding: 12px 24px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            border-top: 2px solid transparent;
+            border-left: 2px solid transparent;
+            border-right: 2px solid transparent;
+            transition: background 0.2s;
+        }
 
-             #mynetwork {
-                 width: 100%;
-                 height: 900px;
-                 background-color: #ffffff;
-                 border: 1px solid lightgray;
-                 position: relative;
-                 float: left;
-             }
+        .tab-button:hover {
+            background: #d0d0d0;
+        }
 
-             
+        .tab-button.active {
+            background: white;
+            border-top: 2px solid #333;
+            border-left: 2px solid #333;
+            border-right: 2px solid #333;
+            border-bottom: 2px solid white;
+            margin-bottom: -2px;
+        }
 
-             
+        .tab-content {
+            display: none;
+            background: white;
+        }
 
-             
-        </style>
-    </head>
+        .tab-content.active {
+            display: block;
+        }
 
+        #cy {
+            width: 100%;
+            height: 800px;
+            background: #ffffff;
+        }
 
-    <body>
-    <div style="position: absolute; top: 80px; left: 10px; background: white;
-                padding: 15px; border: 2px solid #333; border-radius: 8px;
-                font-family: Tahoma; box-shadow: 2px 2px 8px rgba(0,0,0,0.3); z-index: 1000;">
-        <h3 style="margin-top: 0; border-bottom: 2px solid #333; padding-bottom: 5px;">Legend</h3>
+        #graph-tab {
+            position: relative;
+        }
 
-        <h4 style="margin-bottom: 5px;">Link Types:</h4>
-        <div style="margin-left: 10px;">
-            <div style="margin: 5px 0;">
-                <span style="display: inline-block; width: 40px; height: 3px;
-                             background: #00bcd4; border-top: 2px dashed #00bcd4;
-                             vertical-align: middle;"></span>
-                <span style="margin-left: 10px;"><b>Temporal</b> - Time-based (cyan, dashed)</span>
+        #table-tab {
+            padding: 20px;
+        }
+
+        .legend {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: white;
+            padding: 15px;
+            border: 2px solid #333;
+            border-radius: 8px;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.3);
+            z-index: 1000;
+            max-width: 250px;
+        }
+
+        .legend h3 {
+            margin-top: 0;
+            border-bottom: 2px solid #333;
+            padding-bottom: 5px;
+        }
+
+        .legend-item {
+            margin: 8px 0;
+            display: flex;
+            align-items: center;
+        }
+
+        .legend-line {
+            width: 30px;
+            height: 2px;
+            margin-right: 10px;
+        }
+
+        .legend-node {
+            width: 20px;
+            height: 20px;
+            margin-right: 10px;
+            border: 1px solid #999;
+            border-radius: 3px;
+        }
+
+        #table-filter {
+            width: 100%;
+            max-width: 600px;
+            padding: 10px;
+            margin-bottom: 15px;
+            border: 2px solid #ccc;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+
+        #memory-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            max-width: 1400px;
+        }
+
+        #memory-table th {
+            padding: 10px;
+            text-align: left;
+            border: 1px solid #ddd;
+            background: #f0f0f0;
+        }
+
+        #memory-table td {
+            padding: 8px;
+            border: 1px solid #ddd;
+        }
+
+        .tooltip {
+            position: absolute;
+            background: white;
+            border: 2px solid #333;
+            border-radius: 4px;
+            padding: 10px;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.3);
+            max-width: 300px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 9999;
+        }
+    </style>
+</head>
+<body>
+    <div class="tab-container">
+        <div class="tab-buttons">
+            <button class="tab-button active" onclick="switchTab('graph')">Graph View</button>
+            <button class="tab-button" onclick="switchTab('table')">Table View</button>
+        </div>
+
+        <div id="graph-tab" class="tab-content active">
+            <div style="padding: 15px; background: #f9f9f9; border-bottom: 2px solid #333;">
+                <div style="display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
+                    <div>
+                        <label style="font-weight: bold; margin-right: 5px;">Limit nodes:</label>
+                        <input type="number" id="node-limit" value="50" min="10" max="1000" step="10"
+                               style="width: 80px; padding: 5px; border: 1px solid #ccc; border-radius: 4px;">
+                    </div>
+                    <div>
+                        <label style="font-weight: bold; margin-right: 5px;">Layout:</label>
+                        <select id="layout-select" style="padding: 5px; border: 1px solid #ccc; border-radius: 4px;">
+                            <option value="circle">Circle (fast)</option>
+                            <option value="grid">Grid (fast)</option>
+                            <option value="cose">Force-directed (slow)</option>
+                        </select>
+                    </div>
+                    <button onclick="reloadGraph()" style="padding: 6px 15px; background: #42a5f5; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">
+                        Apply
+                    </button>
+                    <span id="node-count" style="color: #666; font-size: 14px;"></span>
+                </div>
             </div>
-            <div style="margin: 5px 0;">
-                <span style="display: inline-block; width: 40px; height: 3px;
-                             background: #ff69b4; vertical-align: middle;"></span>
-                <span style="margin-left: 10px;"><b>Semantic</b> - Meaning-based (pink, solid)</span>
-            </div>
-            <div style="margin: 5px 0;">
-                <span style="display: inline-block; width: 40px; height: 5px;
-                             background: #ffd700; vertical-align: middle;"></span>
-                <span style="margin-left: 10px;"><b>Entity</b> - Same entity (gold, thick)</span>
+            <div id="cy"></div>
+            <div class="legend">
+                <h3>Legend</h3>
+                <h4 style="margin: 10px 0 5px 0;">Link Types:</h4>
+                <div class="legend-item">
+                    <div class="legend-line" style="background: #00bcd4; border-top: 1px dashed #00bcd4;"></div>
+                    <span><b>Temporal</b></span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-line" style="background: #ff69b4;"></div>
+                    <span><b>Semantic</b></span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-line" style="background: #ffd700;"></div>
+                    <span><b>Entity</b></span>
+                </div>
+                <h4 style="margin: 15px 0 5px 0;">Nodes:</h4>
+                <div class="legend-item">
+                    <div class="legend-node" style="background: #e0e0e0;"></div>
+                    <span>No entities</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-node" style="background: #90caf9;"></div>
+                    <span>1 entity</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-node" style="background: #42a5f5;"></div>
+                    <span>2+ entities</span>
+                </div>
             </div>
         </div>
 
-        <h4 style="margin-bottom: 5px; margin-top: 15px;">Node Colors:</h4>
-        <div style="margin-left: 10px;">
-            <div style="margin: 5px 0;">
-                <span style="display: inline-block; width: 20px; height: 20px;
-                             background: #e0e0e0; border: 1px solid #999;
-                             vertical-align: middle;"></span>
-                <span style="margin-left: 10px;">Gray - No entities</span>
+        <div id="table-tab" class="tab-content">
+            <h2>Memory Units (0)</h2>
+            <input type="text" id="table-filter" placeholder="Filter by text, context, or entities...">
+            <div style="overflow-x: auto;">
+                <table id="memory-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Text</th>
+                            <th>Context</th>
+                            <th>Date</th>
+                            <th>Entities</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        
+                    </tbody>
+                </table>
             </div>
-            <div style="margin: 5px 0;">
-                <span style="display: inline-block; width: 20px; height: 20px;
-                             background: #90caf9; border: 1px solid #999;
-                             vertical-align: middle;"></span>
-                <span style="margin-left: 10px;">Light Blue - 1 entity</span>
-            </div>
-            <div style="margin: 5px 0;">
-                <span style="display: inline-block; width: 20px; height: 20px;
-                             background: #42a5f5; border: 1px solid #999;
-                             vertical-align: middle;"></span>
-                <span style="margin-left: 10px;">Dark Blue - 2+ entities</span>
-            </div>
-        </div>
-
-        <div style="margin-top: 15px; padding-top: 10px; border-top: 1px solid #ccc;
-                    font-size: 11px; color: #666;">
-            <b>Tip:</b> Hover over nodes/edges for details<br>
-            <b>Controls:</b> Drag to move, scroll to zoom
         </div>
     </div>
-    
-        <div class="card" style="width: 100%">
-            
-            
-            <div id="mynetwork" class="card-body"></div>
-        </div>
 
-        
-        
+    <script>
+        // Graph data
+        const allGraphData = {"nodes": [], "edges": []};
+        let cy = null;
 
-        <script type="text/javascript">
+        // Initialize graph with filtering
+        function initGraph(nodeLimit, layoutName) {
+            // Filter nodes to limit
+            const limitedNodes = allGraphData.nodes.slice(0, nodeLimit);
+            const nodeIds = new Set(limitedNodes.map(n => n.data.id));
 
-              // initialize global variables.
-              var edges;
-              var nodes;
-              var allNodes;
-              var allEdges;
-              var nodeColors;
-              var originalNodes;
-              var network;
-              var container;
-              var options, data;
-              var filter = {
-                  item : '',
-                  property : '',
-                  value : []
-              };
+            // Filter edges to only include those between visible nodes
+            const limitedEdges = allGraphData.edges.filter(e =>
+                nodeIds.has(e.data.source) && nodeIds.has(e.data.target)
+            );
 
-              
+            // Update count display
+            document.getElementById('node-count').textContent =
+                `Showing ${limitedNodes.length} of ${allGraphData.nodes.length} nodes`;
 
-              
+            // Destroy existing graph if any
+            if (cy) {
+                cy.destroy();
+            }
 
-              // This method is responsible for drawing the graph, returns the drawn network
-              function drawGraph() {
-                  var container = document.getElementById('mynetwork');
+            // Layout configurations
+            const layouts = {
+                'circle': {
+                    name: 'circle',
+                    animate: false,
+                    radius: 300,
+                    spacingFactor: 1.5
+                },
+                'grid': {
+                    name: 'grid',
+                    animate: false,
+                    rows: Math.ceil(Math.sqrt(limitedNodes.length)),
+                    cols: Math.ceil(Math.sqrt(limitedNodes.length)),
+                    spacingFactor: 2
+                },
+                'cose': {
+                    name: 'cose',
+                    animate: false,
+                    nodeRepulsion: 15000,
+                    idealEdgeLength: 150,
+                    edgeElasticity: 100,
+                    nestingFactor: 1.2,
+                    gravity: 1,
+                    numIter: 1000,
+                    initialTemp: 200,
+                    coolingFactor: 0.95,
+                    minTemp: 1.0
+                }
+            };
 
-                  
+            // Initialize Cytoscape
+            cy = cytoscape({
+                container: document.getElementById('cy'),
 
-                  // parsing and collecting nodes and edges from the python
-                  nodes = new vis.DataSet([{"color": "#42a5f5", "font": {"color": "#000000"}, "id": "749319d1-c2a6-4b63-ad6f-48db1f488051", "label": "Alice goes hiking every weekend in Yosemite.", "shape": "box", "size": 30, "title": "\n        \u003cb\u003eText:\u003c/b\u003e Alice goes hiking every weekend in Yosemite.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-23\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Casual conversation about hobbies\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e Yosemite (GPE)\\nAlice (PERSON)\n        "}, {"color": "#90caf9", "font": {"color": "#000000"}, "id": "e7a80842-2654-4902-98f4-660f1a465461", "label": "Alice told me she loves hiking in the mountains.", "shape": "box", "size": 25, "title": "\n        \u003cb\u003eText:\u003c/b\u003e Alice told me she loves hiking in the mountains.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-23\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Casual conversation about hobbies\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e Alice (PERSON)\n        "}, {"color": "#42a5f5", "font": {"color": "#000000"}, "id": "04826ba5-af05-4316-922e-3982198aa66d", "label": "Alice joined Google last year and loves the cultur...", "shape": "box", "size": 30, "title": "\n        \u003cb\u003eText:\u003c/b\u003e Alice joined Google last year and loves the culture.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-27\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Discussion about careers\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e Google (ORG)\\nAlice (PERSON)\n        "}, {"color": "#42a5f5", "font": {"color": "#000000"}, "id": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "label": "Alice works at Google as a software engineer.", "shape": "box", "size": 30, "title": "\n        \u003cb\u003eText:\u003c/b\u003e Alice works at Google as a software engineer.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-27\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Discussion about careers\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e Google (ORG)\\nAlice (PERSON)\n        "}, {"color": "#90caf9", "font": {"color": "#000000"}, "id": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "label": "Bob mentioned he enjoys rock climbing.", "shape": "box", "size": 25, "title": "\n        \u003cb\u003eText:\u003c/b\u003e Bob mentioned he enjoys rock climbing.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-29\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Outdoor activities discussion\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e Bob (PERSON)\n        "}, {"color": "#90caf9", "font": {"color": "#000000"}, "id": "3546239f-acf8-4317-9217-80f9ef30eaea", "label": "Bob climbs in Yosemite too, on weekends.", "shape": "box", "size": 25, "title": "\n        \u003cb\u003eText:\u003c/b\u003e Bob climbs in Yosemite too, on weekends.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-29\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Outdoor activities discussion\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e Bob (PERSON)\n        "}, {"color": "#e0e0e0", "font": {"color": "#000000"}, "id": "a6e9decf-e17f-496a-badf-e9339dfe1a09", "label": "the Python project uses machine learning.", "shape": "box", "size": 20, "title": "\n        \u003cb\u003eText:\u003c/b\u003e the Python project uses machine learning.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-30\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Technical discussion\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e No entities\n        "}, {"color": "#42a5f5", "font": {"color": "#000000"}, "id": "dc685eca-d533-4d41-a3d4-551b642d18fc", "label": "Alice is working on a Python project at Google.", "shape": "box", "size": 30, "title": "\n        \u003cb\u003eText:\u003c/b\u003e Alice is working on a Python project at Google.\u003cbr\u003e\n        \u003cb\u003eDate:\u003c/b\u003e 2025-10-30\u003cbr\u003e\n        \u003cb\u003eContext:\u003c/b\u003e Technical discussion\u003cbr\u003e\n        \u003cb\u003eEntities:\u003c/b\u003e Google (ORG)\\nAlice (PERSON)\n        "}]);
-                  edges = new vis.DataSet([{"color": "#ffd700", "dashes": false, "from": "749319d1-c2a6-4b63-ad6f-48db1f488051", "label": "Alice: 1.00", "title": "ENTITY: 1.000 (Entity: Alice)", "to": "e7a80842-2654-4902-98f4-660f1a465461", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "dc685eca-d533-4d41-a3d4-551b642d18fc", "label": "Google: 1.00", "title": "ENTITY: 1.000 (Entity: Google)", "to": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "dc685eca-d533-4d41-a3d4-551b642d18fc", "label": "Google: 1.00", "title": "ENTITY: 1.000 (Entity: Google)", "to": "04826ba5-af05-4316-922e-3982198aa66d", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "3546239f-acf8-4317-9217-80f9ef30eaea", "label": "Bob: 1.00", "title": "ENTITY: 1.000 (Entity: Bob)", "to": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "label": "Alice: 1.00", "title": "ENTITY: 1.000 (Entity: Alice)", "to": "749319d1-c2a6-4b63-ad6f-48db1f488051", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "label": "Alice: 1.00", "title": "ENTITY: 1.000 (Entity: Alice)", "to": "e7a80842-2654-4902-98f4-660f1a465461", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "dc685eca-d533-4d41-a3d4-551b642d18fc", "label": "Alice: 1.00", "title": "ENTITY: 1.000 (Entity: Alice)", "to": "e7a80842-2654-4902-98f4-660f1a465461", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "dc685eca-d533-4d41-a3d4-551b642d18fc", "label": "Alice: 1.00", "title": "ENTITY: 1.000 (Entity: Alice)", "to": "749319d1-c2a6-4b63-ad6f-48db1f488051", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "04826ba5-af05-4316-922e-3982198aa66d", "label": "Google: 1.00", "title": "ENTITY: 1.000 (Entity: Google)", "to": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "04826ba5-af05-4316-922e-3982198aa66d", "label": "Alice: 1.00", "title": "ENTITY: 1.000 (Entity: Alice)", "to": "749319d1-c2a6-4b63-ad6f-48db1f488051", "value": 3.0, "width": 4}, {"color": "#ffd700", "dashes": false, "from": "04826ba5-af05-4316-922e-3982198aa66d", "label": "Alice: 1.00", "title": "ENTITY: 1.000 (Entity: Alice)", "to": "e7a80842-2654-4902-98f4-660f1a465461", "value": 3.0, "width": 4}, {"color": "#ff69b4", "dashes": false, "from": "3546239f-acf8-4317-9217-80f9ef30eaea", "label": "S: 0.90", "title": "SEMANTIC: 0.903", "to": "749319d1-c2a6-4b63-ad6f-48db1f488051", "value": 2.71039057559799, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a6e9decf-e17f-496a-badf-e9339dfe1a09", "label": "S: 0.88", "title": "SEMANTIC: 0.876", "to": "dc685eca-d533-4d41-a3d4-551b642d18fc", "value": 2.627091898766076, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "label": "S: 0.87", "title": "SEMANTIC: 0.867", "to": "e7a80842-2654-4902-98f4-660f1a465461", "value": 2.601015997054119, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "label": "S: 0.84", "title": "SEMANTIC: 0.839", "to": "749319d1-c2a6-4b63-ad6f-48db1f488051", "value": 2.517087521205864, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "3546239f-acf8-4317-9217-80f9ef30eaea", "label": "S: 0.83", "title": "SEMANTIC: 0.833", "to": "e7a80842-2654-4902-98f4-660f1a465461", "value": 2.500378757782956, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a6e9decf-e17f-496a-badf-e9339dfe1a09", "label": "S: 0.79", "title": "SEMANTIC: 0.793", "to": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "value": 2.3786623139386167, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "3546239f-acf8-4317-9217-80f9ef30eaea", "label": "S: 0.78", "title": "SEMANTIC: 0.784", "to": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "value": 2.352983586934743, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "label": "S: 0.78", "title": "SEMANTIC: 0.784", "to": "04826ba5-af05-4316-922e-3982198aa66d", "value": 2.350930312220439, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "label": "S: 0.78", "title": "SEMANTIC: 0.777", "to": "3b718943-4ac8-43d8-96bc-b25ce3280a39", "value": 2.331290274675819, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "dc685eca-d533-4d41-a3d4-551b642d18fc", "label": "S: 0.77", "title": "SEMANTIC: 0.774", "to": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "value": 2.3232115525225376, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "3546239f-acf8-4317-9217-80f9ef30eaea", "label": "S: 0.77", "title": "SEMANTIC: 0.771", "to": "04826ba5-af05-4316-922e-3982198aa66d", "value": 2.314053654670731, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a6e9decf-e17f-496a-badf-e9339dfe1a09", "label": "S: 0.76", "title": "SEMANTIC: 0.760", "to": "04826ba5-af05-4316-922e-3982198aa66d", "value": 2.279010944602281, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a6e9decf-e17f-496a-badf-e9339dfe1a09", "label": "S: 0.74", "title": "SEMANTIC: 0.736", "to": "a60a9d42-b4c3-4de1-895b-dcc0c8d59a51", "value": 2.2074379550031873, "width": 2}, {"color": "#ff69b4", "dashes": false, "from": "a6e9decf-e17f-496a-badf-e9339dfe1a09", "label": "S: 0.73", "title": "SEMANTIC: 0.734", "to": "749319d1-c2a6-4b63-ad6f-48db1f488051", "value": 2.2021311997098, "width": 2}]);
+                elements: [
+                    ...limitedNodes.map(n => ({ data: n.data })),
+                    ...limitedEdges.map(e => ({ data: e.data }))
+                ],
 
-                  nodeColors = {};
-                  allNodes = nodes.get({ returnType: "Object" });
-                  for (nodeId in allNodes) {
-                    nodeColors[nodeId] = allNodes[nodeId].color;
-                  }
-                  allEdges = edges.get({ returnType: "Object" });
-                  // adding nodes and edges to the graph
-                  data = {nodes: nodes, edges: edges};
+                style: [
+                    {
+                        selector: 'node',
+                        style: {
+                            'background-color': 'data(color)',
+                            'label': 'data(label)',
+                            'text-valign': 'center',
+                            'text-halign': 'center',
+                            'font-size': '10px',
+                            'font-weight': 'bold',
+                            'text-wrap': 'wrap',
+                            'text-max-width': '100px',
+                            'width': 40,
+                            'height': 40,
+                            'border-width': 2,
+                            'border-color': '#333'
+                        }
+                    },
+                    {
+                        selector: 'edge',
+                        style: {
+                            'width': 1,
+                            'line-color': 'data(color)',
+                            'line-style': 'data(lineStyle)',
+                            'target-arrow-shape': 'triangle',
+                            'target-arrow-color': 'data(color)',
+                            'curve-style': 'bezier',
+                            'opacity': 0.7
+                        }
+                    },
+                    {
+                        selector: 'node:selected',
+                        style: {
+                            'border-width': 4,
+                            'border-color': '#000'
+                        }
+                    }
+                ],
 
-                  var options = {"nodes": {"font": {"size": 14, "face": "Tahoma"}, "borderWidth": 2, "borderWidthSelected": 3}, "edges": {"smooth": {"type": "continuous", "forceDirection": "none"}, "font": {"size": 12, "align": "middle"}}, "physics": {"enabled": true, "stabilization": {"enabled": true, "iterations": 200}, "barnesHut": {"gravitationalConstant": -8000, "centralGravity": 0.3, "springLength": 200, "springConstant": 0.04, "damping": 0.09}}, "interaction": {"hover": true, "tooltipDelay": 100, "navigationButtons": true, "keyboard": true}};
+                layout: layouts[layoutName] || layouts['circle']
+            });
 
-                  
+            // Simple tooltip on hover
+            let tooltip = null;
 
+            cy.on('mouseover', 'node', function(evt) {
+                const node = evt.target;
+                const data = node.data();
+                const renderedPosition = node.renderedPosition();
 
-                  
+                // Create tooltip
+                tooltip = document.createElement('div');
+                tooltip.className = 'tooltip';
+                tooltip.innerHTML = `
+                    <b>Text:</b> ${data.text}<br>
+                    <b>Context:</b> ${data.context}<br>
+                    <b>Date:</b> ${data.date}<br>
+                    <b>Entities:</b> ${data.entities}
+                `;
+                tooltip.style.left = renderedPosition.x + 20 + 'px';
+                tooltip.style.top = renderedPosition.y + 'px';
+                document.body.appendChild(tooltip);
+            });
 
-                  network = new vis.Network(container, data, options);
+            cy.on('mouseout', 'node', function(evt) {
+                if (tooltip) {
+                    tooltip.remove();
+                    tooltip = null;
+                }
+            });
+        }
 
-                  
+        // Reload graph with current settings
+        function reloadGraph() {
+            const nodeLimit = parseInt(document.getElementById('node-limit').value) || 50;
+            const layoutName = document.getElementById('layout-select').value;
+            initGraph(nodeLimit, layoutName);
+        }
 
-                  
+        // Initialize with default settings (50 nodes, circle layout)
+        initGraph(50, 'circle');
 
-                  
+        // Tab switching
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
 
+            if (tabName === 'graph') {
+                document.getElementById('graph-tab').classList.add('active');
+                document.querySelectorAll('.tab-button')[0].classList.add('active');
+                cy.resize();  // Resize graph when switching to it
+            } else if (tabName === 'table') {
+                document.getElementById('table-tab').classList.add('active');
+                document.querySelectorAll('.tab-button')[1].classList.add('active');
+            }
+        }
 
-                  
+        // Table filtering
+        document.getElementById('table-filter').addEventListener('input', function() {
+            const filterValue = this.value.toLowerCase();
+            const rows = document.querySelectorAll('#memory-table tbody tr');
 
-                  return network;
-
-              }
-              drawGraph();
-        </script>
-    </body>
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                if (text.includes(filterValue)) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+        });
+    </script>
+</body>
 </html>
